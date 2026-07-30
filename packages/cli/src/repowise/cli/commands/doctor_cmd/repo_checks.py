@@ -406,6 +406,9 @@ def _run_repo_checks(
     # 11. Distill — config block, omission store, rewrite hook (advisory)
     checks.extend(_distill_checks(repo_path))
 
+    # 11b. VB.NET dotnet SDK prerequisite (advisory, only shown when the repo has .vb files)
+    checks.extend(_vb_checks(repo_path))
+
     # 12. Claude Code MCP registration: wedged-path detection
     registration_check, registration_wedged = _claude_registration_check()
     checks.append(registration_check)
@@ -711,3 +714,36 @@ def _distill_checks(repo_path: _DoctorPath) -> list[DoctorCheck]:
         checks.append(_check("Distill rewrite hook", True, f"Could not check: {exc}"))
 
     return checks
+
+
+def _vb_checks(repo_path: _DoctorPath) -> list[DoctorCheck]:
+    """VB.NET dotnet SDK prerequisite (D3) — advisory, only shown when relevant.
+
+    Surfaces the requirement before an ``init`` aborts on it. The row is
+    only interesting (and only costs a `.vb` scan + a `dotnet` probe) when
+    the repo actually contains VB.
+    """
+    try:
+        from repowise.core.ingestion.vb.preflight import check_dotnet_sdk, repo_has_vb_files
+
+        if not repo_has_vb_files(_DoctorPath(repo_path)):
+            return []
+
+        check = check_dotnet_sdk()
+        if check.meets_minimum:
+            detail = f"{', '.join(check.sdk_versions)} (via {check.dotnet_exe})"
+        elif check.dotnet_exe:
+            detail = (
+                f"dotnet found ({check.dotnet_exe}) but no SDK >= 8.0 "
+                f"(have: {', '.join(check.sdk_versions) or 'none'}). "
+                "Install: https://dotnet.microsoft.com/download"
+            )
+        else:
+            detail = (
+                "dotnet SDK not found; VB.NET files require it. "
+                "Install: https://dotnet.microsoft.com/download, "
+                "or exclude with -x '**/*.vb'"
+            )
+        return [_check("VB.NET dotnet SDK", check.meets_minimum, detail)]
+    except Exception as exc:
+        return [_check("VB.NET dotnet SDK", True, f"Could not check: {exc}")]

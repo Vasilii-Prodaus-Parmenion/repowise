@@ -107,6 +107,11 @@ logs/
 # Docker
 docker-compose.override.yml
 
+# .NET build output — the VB Roslyn sidecar (ingestion/vb/sidecar_src/) and
+# the .NET test fixtures under tests/fixtures/ both produce these locally.
+bin/
+obj/
+
 # OS
 .DS_Store
 .DS_Store?

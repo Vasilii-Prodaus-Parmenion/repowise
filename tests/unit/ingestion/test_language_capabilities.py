@@ -30,22 +30,25 @@ from repowise.core.ingestion.languages.registry import REGISTRY
 
 class TestParityGoldens:
     def test_entry_filename_stems_match_historical_set(self) -> None:
-        assert frozenset(
-            {
-                "index",
-                "main",
-                "app",
-                "server",
-                "mod",
-                "manage",
-                "wsgi",
-                "asgi",
-                "cli",
-                "__main__",
-                "bootstrap",
-                "entry",
-            }
-        ) == _ENTRY_FILENAME_STEMS
+        assert (
+            frozenset(
+                {
+                    "index",
+                    "main",
+                    "app",
+                    "server",
+                    "mod",
+                    "manage",
+                    "wsgi",
+                    "asgi",
+                    "cli",
+                    "__main__",
+                    "bootstrap",
+                    "entry",
+                }
+            )
+            == _ENTRY_FILENAME_STEMS
+        )
 
     def test_test_stem_prefixes_match_historical_set(self) -> None:
         assert set(REGISTRY.test_stem_prefixes()) == {"test_"}
@@ -59,9 +62,9 @@ class TestParityGoldens:
         assert set(REGISTRY.test_infixes()) == {".test.", ".spec."}
 
     def test_test_fixture_stems_match_historical_set(self) -> None:
-        assert frozenset(
-            {"conftest", "spec_helper", "test_helper"}
-        ) == REGISTRY.test_fixture_stems()
+        assert (
+            frozenset({"conftest", "spec_helper", "test_helper"}) == REGISTRY.test_fixture_stems()
+        )
 
     def test_suite_anchor_stems(self) -> None:
         # ruby (rspec/minitest helpers) and elixir (ExUnit's
@@ -99,8 +102,15 @@ class TestParityGoldens:
         # Case-sensitive camel-boundary test suffixes per language.
         camel = REGISTRY.camel_test_res_by_extension()
         assert set(camel) == {
-            ".java", ".kt", ".kts", ".scala", ".cs", ".swift", ".php",
-            ".hs", ".lhs",
+            ".java",
+            ".kt",
+            ".kts",
+            ".scala",
+            ".cs",
+            ".swift",
+            ".php",
+            ".hs",
+            ".lhs",
         }
         assert camel[".java"].pattern == r"(?<=[a-z0-9])(?:Tests|Test|IT)$"
         assert camel[".scala"].pattern == r"(?<=[a-z0-9])(?:Suite|Spec|Test)$"
@@ -145,6 +155,9 @@ _FULL = {
     "rust",
     "swift",
     "typescript",
+    # vbnet resolves via the same DotNetProjectIndex as csharp, generalized
+    # to .vbproj in Phase 3 of vb-support.md (resolvers/vbnet.py).
+    "vbnet",
 }
 _PARTIAL = {
     "luau",
@@ -228,9 +241,7 @@ class TestDriftManifests:
 
     def test_non_code_languages_are_config_plus_infra_plus_aliases(self) -> None:
         assert (
-            REGISTRY.config_languages()
-            | REGISTRY.infra_languages()
-            | frozenset(_NON_CODE_ALIASES)
+            REGISTRY.config_languages() | REGISTRY.infra_languages() | frozenset(_NON_CODE_ALIASES)
         ) == _NON_CODE_LANGUAGES
         # The once-missing is_code=False tags and infra tags are covered …
         assert {

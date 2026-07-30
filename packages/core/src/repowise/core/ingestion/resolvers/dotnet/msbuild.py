@@ -1,9 +1,17 @@
-"""Parse MSBuild project files (.csproj, Directory.Build.props/targets).
+"""Parse MSBuild project files (.csproj, .vbproj, Directory.Build.props/targets).
 
 Only the fields repowise actually uses are extracted: ProjectReference,
 PackageReference, RootNamespace, AssemblyName, ImplicitUsings, and
-project-level <Using Include=...> items. The parser tolerates both
-SDK-style and legacy XML (``<Project ToolsVersion="...">``).
+project-level <Using Include=...> (C#) / <Import Include=...> (VB) items.
+The parser tolerates both SDK-style and legacy XML
+(``<Project ToolsVersion="...">``).
+
+``.vbproj`` support (vb-support.md D7, §7): VB has no ``global using``
+syntax, so its project-wide-visible namespaces are declared entirely as
+``<Import Include="System.Linq" />`` ItemGroup entries rather than scanned
+from source. Those share the ``project_usings`` field with C#'s
+``<Using Include=...>`` items — same consumer (``global_usings.py``),
+different MSBuild item name.
 """
 
 from __future__ import annotations
@@ -42,17 +50,24 @@ DOTNET_SCAN_SKIP_DIRS: frozenset[str] = frozenset(
 )
 _DOTNET_SCAN_SKIP_DIRS_CASEFOLDED = frozenset(part.casefold() for part in DOTNET_SCAN_SKIP_DIRS)
 
+# MSBuild project file extensions this module understands. MSBuildProject is
+# extension-agnostic in shape (D7) — a .vbproj parses into the same
+# dataclass a .csproj does.
+PROJECT_EXTENSIONS: frozenset[str] = frozenset({".csproj", ".vbproj"})
+
 
 @dataclass
 class MSBuildProject:
     """Parsed MSBuild project file."""
 
-    path: Path  # absolute path to the .csproj
+    path: Path  # absolute path to the .csproj or .vbproj
     project_dir: Path  # directory containing the .csproj
     root_namespace: str | None = None
     assembly_name: str | None = None
     implicit_usings: bool = False
-    project_references: list[Path] = field(default_factory=list)  # absolute paths to referenced .csproj
+    project_references: list[Path] = field(
+        default_factory=list
+    )  # absolute paths to referenced .csproj
     package_references: set[str] = field(default_factory=set)  # NuGet package ids
     project_usings: set[str] = field(default_factory=set)  # <Using Include="X"/> namespaces
 
@@ -73,15 +88,15 @@ def _bool(value: str | None) -> bool:
     return (value or "").strip().lower() in ("true", "enable", "1")
 
 
-def parse_csproj(csproj_path: Path) -> MSBuildProject | None:
-    """Parse a single .csproj file. Returns None on parse failure."""
+def parse_project(project_path: Path) -> MSBuildProject | None:
+    """Parse a single .csproj/.vbproj file. Returns None on parse failure."""
     try:
-        tree = ET.parse(csproj_path)
+        tree = ET.parse(project_path)
     except (ET.ParseError, OSError) as exc:
-        log.debug("Failed to parse csproj", path=str(csproj_path), error=str(exc))
+        log.debug("Failed to parse project file", path=str(project_path), error=str(exc))
         return None
 
-    project = MSBuildProject(path=csproj_path.resolve(), project_dir=csproj_path.parent.resolve())
+    project = MSBuildProject(path=project_path.resolve(), project_dir=project_path.parent.resolve())
     root = tree.getroot()
 
     for elem in root.iter():
@@ -109,18 +124,37 @@ def parse_csproj(csproj_path: Path) -> MSBuildProject | None:
             ns = elem.get("Include")
             if ns:
                 project.project_usings.add(ns.strip())
+        elif tag == "Import":
+            # VB's ItemGroup-level project-wide import ("Imports" without a
+            # per-file directive, D7): <Import Include="System.Linq" />.
+            # Distinguished from the unrelated top-level
+            # <Import Project="Foo.props" /> (which pulls in another
+            # MSBuild file) by attribute name — that one never sets
+            # Include.
+            ns = elem.get("Include")
+            if ns:
+                project.project_usings.add(ns.strip())
 
     return project
 
 
-def find_csproj_files(repo_path: Path, *, prune_nested_git: bool = True) -> list[Path]:
-    """Return all .csproj files under *repo_path*, skipping bin/obj output."""
+# Back-compat alias — every prior caller (index.py, tests) imports this name.
+parse_csproj = parse_project
+
+
+def find_project_files(repo_path: Path, *, prune_nested_git: bool = True) -> list[Path]:
+    """Return all .csproj/.vbproj files under *repo_path*, skipping bin/obj output."""
     out: list[Path] = []
-    for csproj in iter_glob(repo_path, "*.csproj", prune_nested_git=prune_nested_git):
-        if path_has_dotnet_scan_skip_dir(csproj, repo_path):
-            continue
-        out.append(csproj)
+    for ext in sorted(PROJECT_EXTENSIONS):
+        for proj in iter_glob(repo_path, f"*{ext}", prune_nested_git=prune_nested_git):
+            if path_has_dotnet_scan_skip_dir(proj, repo_path):
+                continue
+            out.append(proj)
     return out
+
+
+# Back-compat alias — every prior caller (index.py, tests) imports this name.
+find_csproj_files = find_project_files
 
 
 def path_has_dotnet_scan_skip_dir(path: Path, repo_root: Path) -> bool:

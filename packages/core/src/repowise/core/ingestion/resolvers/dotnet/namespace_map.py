@@ -114,6 +114,66 @@ def declared_type_names(cs_text: str) -> list[str]:
     return [m.group(2) for m in _TYPE_DECL_RE.finditer(cs_text)]
 
 
+_VB_NAMESPACE_RE = re.compile(
+    r"^\s*Namespace\s+([A-Za-z_][\w.]*)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Captures ``Class Foo``, ``Module Foo``, ``Structure Foo``, ``Interface
+# IFoo``, ``Enum Foo``. VB keywords are case-insensitive, and the modifier
+# soup precedes the kind keyword just like C#'s, but there is no
+# `record`/generic/base-clause tail to worry about since a bare identifier
+# ends the declaration we care about (generic ``(Of T)`` and ``Inherits``
+# clauses trail after the name and aren't captured).
+_VB_TYPE_DECL_RE = re.compile(
+    r"(?:^|:)\s*((?:(?:Public|Private|Protected|Friend|Partial|MustInherit|"
+    r"NotInheritable|Shared|MustOverride|Overridable|NotOverridable)\s+)*)"
+    r"(?:Class|Module|Structure|Interface|Enum)\s+([A-Za-z_]\w*)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def declared_namespaces_vb(vb_text: str) -> list[str]:
+    """Return every ``Namespace`` block declared in *vb_text*, in source order.
+
+    Unlike C#, this is the namespace as written in the file only — VB's
+    ``RootNamespace`` (project-level, prepended to every declared namespace
+    and *is* the namespace for files that declare none, vb-support.md §5.5)
+    is not applied here. Callers that need the effective fully-qualified
+    namespace must prepend the owning project's ``RootNamespace``
+    themselves — this function has no project context.
+    """
+    return [m.group(1) for m in _VB_NAMESPACE_RE.finditer(vb_text)]
+
+
+def scan_type_declarations_vb(vb_text: str) -> list[TypeDecl]:
+    """Scan *vb_text* for Class/Module/Structure/Interface/Enum declarations.
+
+    VB has no braces, so unlike :func:`scan_type_declarations` this does not
+    track brace-depth nesting — every declaration's ``qualified`` name equals
+    its bare name, and its namespace is the nearest preceding ``Namespace``
+    block (empty string if none precedes it — RootNamespace is a caller
+    concern, see :func:`declared_namespaces_vb`). VB codebases nest types
+    far less aggressively than C#'s partial-class style, so this is an
+    accepted approximation rather than a wrong qualifier for the common
+    case.
+    """
+    ns_positions = [(m.start(), m.group(1)) for m in _VB_NAMESPACE_RE.finditer(vb_text)]
+
+    decls: list[TypeDecl] = []
+    for m in _VB_TYPE_DECL_RE.finditer(vb_text):
+        name = m.group(2)
+        namespace = ""
+        for ns_start, ns in ns_positions:
+            if ns_start < m.start():
+                namespace = ns
+            else:
+                break
+        is_partial = "partial" in (m.group(1) or "").casefold().split()
+        decls.append(TypeDecl(name, name, namespace, is_partial))
+    return decls
+
+
 def build_namespace_map(
     cs_files: list[Path],
     *,

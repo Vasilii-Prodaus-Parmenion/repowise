@@ -1,7 +1,7 @@
 # Language Support
 
-repowise parses **16 languages to a full AST**, resolves imports and call
-graphs across them, and scores **11 at the Full tier** with code-health markers.
+repowise parses **17 languages to a full AST**, resolves imports and call
+graphs across them, and scores **12 at the Full tier** with code-health markers.
 Everything else in your repo is still tracked through git history and appears in
 the wiki. This page is the "what works for my language today" reference.
 
@@ -19,7 +19,7 @@ produce meaningful output.
 
 | Tier | Languages | What works |
 |------|-----------|------------|
-| **Full** | Python · TypeScript · JavaScript · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
+| **Full** | Python · TypeScript · JavaScript · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby · VB.NET³ | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
 | **Good** | C · Swift · PHP · Dart | Everything above except code-health markers (C, Swift, PHP; Dart *does* get health markers). Dedicated workspace resolvers and framework edges per language |
 | **SQL / dbt** | `.sql` via sqlglot | Tables / views / functions / procedures as symbols with wiki pages; dbt projects get real `ref()` / `source()` lineage |
 | **Shell** | `.sh` `.bash` `.zsh` | Function definitions as symbols, `source` / `.` import edges (incl. `$SCRIPT_DIR` / `dirname` / `$BATS_ROOT` idioms), and function-level code-health complexity (CCN, nesting, cognitive). No class metrics, heritage, bindings, or dead-code flagging |
@@ -47,6 +47,15 @@ build-file fallback); every other Full and Good language resolves imports
 fully.
 ² See [code-health coverage](#code-health-coverage), a language is only "Full"
 once it clears the health checklist.
+³ VB.NET is the one Full-tier language whose AST does not come from
+tree-sitter — there is no maintained grammar for it, so a Roslyn
+(`Microsoft.CodeAnalysis.VisualBasic`) sidecar process parses it instead.
+Requires the **.NET SDK 8.0+** on the machine running `init`/`update` (only
+when the repo actually contains `.vb` files — `repowise doctor` flags it in
+advance, and `-x '**/*.vb'` is the escape hatch). See
+[architecture/vb-support.md](../architecture/vb-support.md) for the full
+design and known gaps (`Option Strict Off` late binding, `#If` conditional
+compilation, no Extract Method / cross-function perf dialect yet).
 
 ---
 
@@ -69,10 +78,14 @@ extractors, and code-health markers.
 | **C#** | `.cs` | `using` / `global using` / `using static` / aliases with `.csproj` / `.sln` resolution; MSBuild project graph; `partial` class linking |
 | **Scala** | `.scala` | `import pkg.Foo`, brace/wildcard/package imports via the shared JVM index (cross-language with Java/Kotlin); SBT / Mill build parsing as fallback (partial import resolution¹) |
 | **Ruby** | `.rb` | `require` / `require_relative` with `$LOAD_PATH` probing, Gemfile externals, RSpec mirror edges, Rails / Zeitwerk autoloading |
+| **VB.NET** | `.vb` | `Imports` (incl. aliases) via the shared dotnet resolver stack — `.vbproj` `RootNamespace` + project-level `Imports`, `ProjectReference` graph shared with C#, case-insensitive same-namespace pass |
 
-All eleven also support three-tier call resolution (same-file, cross-file,
-global stem match) and docstring extraction (Python, Ruby comments, JSDoc,
-GoDoc, Rustdoc, Javadoc, Scaladoc, Doxygen, XML doc).
+The first eleven also support three-tier call resolution (same-file,
+cross-file, global stem match) and docstring extraction (Python, Ruby
+comments, JSDoc, GoDoc, Rustdoc, Javadoc, Scaladoc, Doxygen, XML doc).
+VB.NET resolves same-file and cross-file calls (case-insensitively, matching
+VB's own identifier semantics) but has no global stem-match tier yet; its XML
+`'''` doc comments reuse the same summary-extraction logic as C#.
 
 **Framework-aware edges** connect routes to handlers, DI registrations to
 implementations, and ORM entities to relationships:
@@ -83,6 +96,7 @@ implementations, and ORM entities to relationships:
 | Ruby | Rails (routes → controller actions, Zeitwerk autoloading), RSpec mirror edges |
 | Java / Kotlin | Spring (stereotypes, `@RequestMapping`, Spring Data, `@Bean`), Jakarta / JPA, Quarkus, Micronaut, Android manifest |
 | C# | ASP.NET (attribute + minimal API), EF Core, gRPC-dotnet, host-builder extension methods, CommunityToolkit MVVM |
+| VB.NET | `Handles` / `WithEvents` / `AddHandler` event wiring (WinForms), ASP.NET Web Forms `.aspx`/`.ascx` code-behind pairing |
 | Go | net/http, gin, echo, chi, gRPC server registration |
 | Rust | Axum, Actix route → handler |
 | JS / TS | Next.js App Router, Hono / Fastify / Koa / Elysia, Remix / SvelteKit / Astro, tRPC, Express / NestJS |
@@ -194,6 +208,7 @@ is "Full" vs "Good".
 | Scala | ✅ | ✅ | ✅⁴ | later | ✅⁵ |
 | Ruby | ✅ | ✅⁶ | ✅⁷ | later | ✅⁸ |
 | Shell | ✅⁹ | n/a | n/a | n/a | n/a |
+| VB.NET | ✅¹⁰ | ✅¹¹ | n/a | not planned¹² | ✅¹³ |
 
 ¹ Go methods attach to a type via an external receiver rather than nesting in a
 class body, so class-level metrics aren't computable; Go gets the function- and
@@ -236,6 +251,23 @@ keeps in-memory `Registry.find(name)` lookups silent. Backticks / `system` /
 `&&` / `||` command lists count toward CCN (`cmd || exit 1` is +1), which is
 honest: shell branching is chained command lists. There are no classes,
 assertions, dataflow, or perf dialect for shell.
+¹⁰ Computed by the Roslyn sidecar (`Metrics.cs`), not the tree-sitter walker:
+CCN (`If`/`ElseIf`, each `Case`, `While`, `Do`, `For`, `For Each`, `Catch`,
+`AndAlso`/`OrElse`, the `If()` ternary), cognitive complexity, max nesting,
+NLOC, and `error_handling` hits — including `On Error Resume Next`, VB's own
+strongest "predates structured error handling" signal, with no analogue in
+any other language here.
+¹¹ WMC + an LCOM4/Tight-Class-Cohesion approximation via case-insensitive
+field/method name matching (no semantic model — D1 in vb-support.md). Treat
+VB god-class / low-cohesion findings as lower-confidence than other Full-tier
+languages until validated against a real codebase (vb-support.md §11).
+¹² No dataflow dialect protocol exists for a non-tree-sitter AST yet; would
+need either a second cross-process protocol or an in-Python VB AST walk.
+Degrades to silence, not to a wrong suggestion.
+¹³ Starter set only, from the same sidecar pass: string concatenation in a
+loop, `.Result`/`.Wait()` inside an `Async` method (sync-over-async), and
+per-iteration `New Regex`. No cross-function N+1 detection yet — that rides
+on the dataflow dialect described in footnote ¹².
 
 The **performance** signal (`io_in_loop`, `string_concat_in_loop`,
 `resource_construction_in_loop`, language-specific markers like Go
@@ -259,6 +291,7 @@ where a dialect isn't wired yet. Per-marker mechanics and precision hazards:
 | F# | Good | Lightweight tier shipped; AST upgrade planned (`tree-sitter-f-sharp` available) |
 | SQL / dbt | - | DDL symbols, dbt lineage, app-to-database contracts, health markers shipped. Next: column-level blast radius |
 | Shell | - | Function symbols, `source` import edges, function-level complexity shipped. Next: shebang-based detection of extensionless executables (a traverser capability) |
+| VB.NET | Full (health) | Shipped: Roslyn-sidecar AST (symbols/imports/calls/heritage), project awareness, `Handles`/`AddHandler`/WebForms dynamic hints, complexity + starter perf/error-handling markers. Next: validate LCOM4 approximation against a real codebase; dataflow dialect for Extract Method / cross-function perf |
 
 ---
 

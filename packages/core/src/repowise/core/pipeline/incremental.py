@@ -123,13 +123,15 @@ def build_repo_graph(
     for idx, (fi, source), content_hash in to_parse:
         try:
             if parser is None:
-                parser = ASTParser()
+                parser = ASTParser(repo_path=Path(repo_path))
             parsed = parser.parse_file(fi, source)
         except Exception:
             continue
         merged[idx] = parsed
         if content_hash:
             _cache_parsed(parse_cache, parsed, content_hash)
+    if parser is not None:
+        parser.close()
 
     skipped = len(file_infos) - len(fi_and_bytes)  # unreadable files
     for idx, (fi, source) in enumerate(fi_and_bytes):

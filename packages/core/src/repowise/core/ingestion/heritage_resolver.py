@@ -39,6 +39,12 @@ def _file_language(parsed_files: dict[str, ParsedFile], symbol_id: str) -> str |
     return parsed.file_info.language if parsed else None
 
 
+def _norm_key(name: str, language: str | None) -> str:
+    """Casefold *name* for VB.NET's case-insensitive identifiers — see the
+    identical helper (and its rationale) in ``call_resolver.py``."""
+    return name.casefold() if language == "vbnet" else name
+
+
 # Symbol kinds that can be parents in heritage relationships
 _PARENT_KINDS = frozenset(
     {
@@ -110,12 +116,14 @@ class HeritageResolver:
     def _build_indices(self, parsed_files: dict[str, ParsedFile]) -> None:
         """Build type-level lookup indices from parsed file data."""
         for path, parsed in parsed_files.items():
+            lang = parsed.file_info.language
             file_types: dict[str, str] = {}
 
             for sym in parsed.symbols:
                 if sym.kind in _PARENT_KINDS:
-                    file_types[sym.name] = sym.id
-                    self._global_types[sym.name].append(sym.id)
+                    key = _norm_key(sym.name, lang)
+                    file_types[key] = sym.id
+                    self._global_types[key].append(sym.id)
 
             self._file_types[path] = file_types
 
@@ -150,13 +158,15 @@ class HeritageResolver:
         child_id = f"{file_path}::{rel.child_name}"
         parent_name = rel.parent_name
         edge_type = _heritage_kind_to_edge_type(rel.kind)
+        caller_lang = _file_language(self._parsed_files, file_path)
+        key = _norm_key(parent_name, caller_lang)
 
         # Tier 1: same-file
         file_types = self._file_types.get(file_path, {})
-        if parent_name in file_types:
+        if key in file_types:
             return ResolvedHeritage(
                 child_id=child_id,
-                parent_id=file_types[parent_name],
+                parent_id=file_types[key],
                 edge_type=edge_type,
                 confidence=0.95,
                 line=rel.line,
@@ -164,13 +174,13 @@ class HeritageResolver:
 
         # Tier 2a: specific imported name
         name_to_file = self._import_names.get(file_path, {})
-        if parent_name in name_to_file:
-            source_file = name_to_file[parent_name]
+        if key in name_to_file:
+            source_file = name_to_file[key]
             source_types = self._file_types.get(source_file, {})
-            if parent_name in source_types:
+            if key in source_types:
                 return ResolvedHeritage(
                     child_id=child_id,
-                    parent_id=source_types[parent_name],
+                    parent_id=source_types[key],
                     edge_type=edge_type,
                     confidence=0.90,
                     line=rel.line,
@@ -178,19 +188,18 @@ class HeritageResolver:
 
         # Tier 2b: all imported files (pre-merged lookup)
         merged_types = self._merged_types_for(file_path)
-        if parent_name in merged_types:
+        if key in merged_types:
             return ResolvedHeritage(
                 child_id=child_id,
-                parent_id=merged_types[parent_name],
+                parent_id=merged_types[key],
                 edge_type=edge_type,
                 confidence=0.85,
                 line=rel.line,
             )
 
         # Tier 3: global unique match — only within the same language
-        candidates = self._global_types.get(parent_name, [])
+        candidates = self._global_types.get(key, [])
         if len(candidates) == 1:
-            caller_lang = _file_language(self._parsed_files, child_id)
             callee_lang = _file_language(self._parsed_files, candidates[0])
             if caller_lang and callee_lang and caller_lang != callee_lang:
                 return None  # reject cross-language Tier 3 match

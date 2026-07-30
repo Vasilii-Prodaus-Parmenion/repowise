@@ -17,6 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 # The cost-gate helpers moved to ``repowise.cli.cost_gate`` so ``init`` and
@@ -233,7 +234,7 @@ def _enrich_knowledge_graph(
                 f"{len(enriched.layers)} layers, {len(enriched.tour)} tour steps"
             )
         except Exception as exc:
-            console.print(f"  [yellow]KG enrichment skipped: {exc}[/yellow]")
+            console.print(f"  [yellow]KG enrichment skipped: {escape(str(exc))}[/yellow]")
 
 
 def run_repo_generation(

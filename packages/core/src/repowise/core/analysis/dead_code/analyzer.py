@@ -1025,7 +1025,15 @@ class DeadCodeAnalyzer:
                 # Kotlin sealed parents, Scala typeclass traits).
                 if self.graph.has_node(sym_id) and any(
                     self.graph[pred][sym_id].get("edge_type")
-                    in ("calls", "method_implements", "reads", "extends", "implements", "type_use")
+                    in (
+                        "calls",
+                        "method_implements",
+                        "reads",
+                        "extends",
+                        "implements",
+                        "type_use",
+                        "dynamic",
+                    )
                     for pred in self.graph.predecessors(sym_id)
                 ):
                     continue
@@ -1188,8 +1196,12 @@ class DeadCodeAnalyzer:
                 ):
                     continue
 
+            # "dynamic" alongside "calls": a symbol-targeted DynamicEdge
+            # (e.g. vb/handles.py's Handles/AddHandler wiring, D8) is direct
+            # evidence the symbol is invoked, even though no static call
+            # site exists for it to carry a "calls" edge.
             has_callers = any(
-                self.graph.get_edge_data(pred, node, {}).get("edge_type") == "calls"
+                self.graph.get_edge_data(pred, node, {}).get("edge_type") in ("calls", "dynamic")
                 for pred in self.graph.predecessors(node)
             )
             if has_callers:

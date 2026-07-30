@@ -42,7 +42,11 @@ STORE_FORMAT_VERSION: int = 2
 
 #: Current parser/extractor schema. Folded into the parse-cache fingerprint in
 #: place of the package version. See :mod:`repowise.core.ingestion.parse_cache`.
-PARSER_SCHEMA_VERSION: int = 1
+#:
+#: v2: VB.NET symbol/import/call/heritage extraction (vb-support.md phase 2).
+#: A store indexed under phase 1 has only empty VB ParsedFiles cached; this
+#: bump forces those files to re-parse under the new sidecar-backed logic.
+PARSER_SCHEMA_VERSION: int = 2
 
 #: state.json key holding the store format version that wrote the store.
 STORE_FORMAT_VERSION_KEY = "store_format_version"

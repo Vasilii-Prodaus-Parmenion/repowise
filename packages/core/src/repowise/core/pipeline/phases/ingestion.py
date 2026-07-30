@@ -143,6 +143,13 @@ def _parse_one(path_and_fi_and_bytes: tuple) -> Any:
     """
     global _WORKER_PARSER
     fi, source = path_and_fi_and_bytes
+    if fi.language == "vbnet":
+        # Defense in depth: VB files are partitioned out of `to_parse` before
+        # the pool is even started (see _run_ingestion) — a vbnet FileInfo
+        # reaching a spawned worker is a programming error, not a file that
+        # should silently start its own sidecar process. D6 is one sidecar
+        # per run in the parent process, not N racing first-use builds.
+        return (fi.abs_path, "vbnet FileInfo reached a ProcessPoolExecutor worker")
     try:
         if _WORKER_PARSER is None:
             from repowise.core.ingestion import ASTParser
@@ -151,6 +158,57 @@ def _parse_one(path_and_fi_and_bytes: tuple) -> Any:
         return _WORKER_PARSER.parse_file(fi, source)
     except Exception as exc:
         return (fi.abs_path, str(exc))
+
+
+async def _parse_vb_batch(
+    repo_path: Path,
+    vb_misses: list[tuple[int, tuple, str]],
+    progress: ProgressCallback | None,
+) -> dict[int, Any]:
+    """Parse every vbnet miss through the run-scoped Roslyn sidecar.
+
+    Runs concurrently with the ProcessPoolExecutor parsing every other
+    language's misses (both are awaited together in ``_run_ingestion``) — a
+    mixed C#/VB solution does not serialise the two halves (vb-support.md
+    §5.3). Chunked at 1 files per sidecar request (§4.3) to bound peak
+    memory and let the parse progress bar tick per chunk rather than once
+    at the end.
+    """
+    if not vb_misses:
+        return {}
+    from repowise.core.ingestion.vb.parse import empty_parsed_file, sidecar_result_to_parsed_file
+    from repowise.core.ingestion.vb.rootns import (
+        build_vb_project_namespaces,
+        root_namespace_for_file,
+    )
+    from repowise.core.ingestion.vb.sidecar import get_sidecar, parse_batch
+
+    client = get_sidecar(repo_path)
+    # One project-directory scan for the whole run rather than per chunk —
+    # a solution can have several VB projects with different RootNamespaces
+    # (§4.2), so this feeds a per-file lookup, not a single value.
+    project_namespaces = build_vb_project_namespaces(repo_path)
+    results: dict[int, Any] = {}
+    chunk_size = 1
+    for start in range(0, len(vb_misses), chunk_size):
+        chunk = vb_misses[start : start + chunk_size]
+        chunk_files = [fi for _idx, (fi, _source), _h in chunk]
+        root_namespaces = {
+            fi.path: root_namespace_for_file(project_namespaces, Path(fi.abs_path))
+            for fi in chunk_files
+        }
+        parsed_by_path = await parse_batch(client, chunk_files, root_namespaces=root_namespaces)
+        for idx, (fi, source), _h in chunk:
+            result = parsed_by_path.get(fi.path)
+            if result is None:
+                results[idx] = empty_parsed_file(
+                    fi, source, parse_errors=["VB sidecar returned no result for this file"]
+                )
+            else:
+                results[idx] = sidecar_result_to_parsed_file(fi, source, result)
+            if progress:
+                progress.on_item_done("parse")
+    return results
 
 
 def _split_cached(
@@ -293,6 +351,14 @@ async def _run_ingestion(
     repo_structure = traverser.get_repo_structure(file_infos)
     _phase_done(progress, "traverse")
 
+    # Preflight (D3): nothing gets half-indexed. Traversal has just counted
+    # every language, so this is the earliest point the .vb count is known —
+    # and the latest point before the parse phase can start doing VB work.
+    # A repo with zero .vb files never pays for the dotnet probe.
+    from repowise.core.ingestion.vb.preflight import ensure_vb_prerequisites
+
+    ensure_vb_prerequisites(traverser.stats.lang_counts.get("vbnet", 0))
+
     # Filter
     if skip_tests:
         file_infos = [fi for fi in file_infos if not fi.is_test]
@@ -333,15 +399,25 @@ async def _run_ingestion(
     # entirely (an incremental update re-ingests the whole repo for one
     # changed file). Misses parse exactly as before.
     parse_cache, cached_hits, to_parse = _split_cached(repo_path, fi_and_bytes, progress)
-    workers = max(1, min(os.cpu_count() or 4, len(to_parse) or 1))
+
+    # Partition misses by language (vb-support.md §5.3): vbnet files never
+    # reach the ProcessPoolExecutor (a spawned worker can't own the parent's
+    # asyncio sidecar client — see D6) — they're parsed concurrently via the
+    # run-scoped Roslyn sidecar instead, so a mixed C#/VB solution does not
+    # serialise the two halves.
+    vb_misses = [item for item in to_parse if item[1][0].language == "vbnet"]
+    other_misses = [item for item in to_parse if item[1][0].language != "vbnet"]
+    workers = max(1, min(os.cpu_count() or 4, len(other_misses) or 1))
+
+    vb_task = asyncio.create_task(_parse_vb_batch(repo_path, vb_misses, progress))
 
     parse_results: list[Any] = []
 
-    if to_parse:
+    if other_misses:
         try:
             with ProcessPoolExecutor(max_workers=workers, mp_context=_MP_SPAWN) as pool:
                 tasks = [
-                    loop.run_in_executor(pool, _parse_one, item) for _idx, item, _h in to_parse
+                    loop.run_in_executor(pool, _parse_one, item) for _idx, item, _h in other_misses
                 ]
                 # Tick the parse-progress bar as each worker finishes —
                 # ``asyncio.gather`` would otherwise hold every event back
@@ -349,7 +425,7 @@ async def _run_ingestion(
                 # repos looked like a hang at ``0/N`` for many minutes.
                 # Per-task done-callbacks fire on the event loop thread and
                 # preserve gather's ordered results, so the aggregation
-                # loop below still indexes ``to_parse`` correctly.
+                # loop below still indexes ``other_misses`` correctly.
                 if progress is not None:
                     _parse_tick = lambda _fut: progress.on_item_done("parse")  # noqa: E731
                     for fut in tasks:
@@ -363,7 +439,7 @@ async def _run_ingestion(
             # Fallback: in-process sequential parse
             parse_results = []
             _fallback_parser = ASTParser()
-            for i, (_idx, (fi, source), _h) in enumerate(to_parse):
+            for i, (_idx, (fi, source), _h) in enumerate(other_misses):
                 try:
                     result = _fallback_parser.parse_file(fi, source)
                     parse_results.append(result)
@@ -374,12 +450,18 @@ async def _run_ingestion(
                 if i % 50 == 49:
                     await asyncio.sleep(0)
 
+    vb_results = await vb_task
+
     # Merge fresh parses back into traversal order alongside cache hits.
     merged: dict[int, Any] = dict(cached_hits)
-    for (idx, _item, content_hash), result in zip(to_parse, parse_results, strict=True):
+    for (idx, _item, content_hash), result in zip(other_misses, parse_results, strict=True):
         merged[idx] = result
         if not isinstance(result, tuple | Exception):
             _cache_parsed(parse_cache, result, content_hash)
+    vb_hash_by_idx = {idx: h for idx, _item, h in vb_misses}
+    for idx, parsed in vb_results.items():
+        merged[idx] = parsed
+        _cache_parsed(parse_cache, parsed, vb_hash_by_idx[idx])
 
     # Aggregate results into GraphBuilder on the main loop (not thread-safe).
     for idx in range(len(fi_and_bytes)):
@@ -571,6 +653,13 @@ async def reparse_for_resume(
     repo_structure = traverser.get_repo_structure(file_infos)
     _phase_done(progress, "traverse")
 
+    # Preflight (D3) — same rationale as _run_ingestion: a resumed run
+    # traverses fresh too, so it needs the identical gate before its own
+    # parse phase can start doing VB work.
+    from repowise.core.ingestion.vb.preflight import ensure_vb_prerequisites
+
+    ensure_vb_prerequisites(traverser.stats.lang_counts.get("vbnet", 0))
+
     if skip_tests:
         file_infos = [fi for fi in file_infos if not fi.is_test]
     if skip_infra:
@@ -590,14 +679,18 @@ async def reparse_for_resume(
     loop = asyncio.get_running_loop()
 
     parse_cache, cached_hits, to_parse = _split_cached(repo_path, fi_and_bytes, progress)
-    workers = max(1, min(os.cpu_count() or 4, len(to_parse) or 1))
+    vb_misses = [item for item in to_parse if item[1][0].language == "vbnet"]
+    other_misses = [item for item in to_parse if item[1][0].language != "vbnet"]
+    workers = max(1, min(os.cpu_count() or 4, len(other_misses) or 1))
     parse_results: list[Any] = []
 
-    if to_parse:
+    vb_task = asyncio.create_task(_parse_vb_batch(repo_path, vb_misses, progress))
+
+    if other_misses:
         try:
             with ProcessPoolExecutor(max_workers=workers, mp_context=_MP_SPAWN) as pool:
                 tasks = [
-                    loop.run_in_executor(pool, _parse_one, item) for _idx, item, _h in to_parse
+                    loop.run_in_executor(pool, _parse_one, item) for _idx, item, _h in other_misses
                 ]
                 if progress is not None:
                     _tick = lambda _fut: progress.on_item_done("parse")  # noqa: E731
@@ -608,7 +701,7 @@ async def reparse_for_resume(
             logger.warning("resume_reparse_pool_failed_falling_back", error=str(pool_exc))
             parse_results = []
             _fallback_parser = ASTParser()
-            for i, (_idx, (fi, source), _h) in enumerate(to_parse):
+            for i, (_idx, (fi, source), _h) in enumerate(other_misses):
                 try:
                     parse_results.append(_fallback_parser.parse_file(fi, source))
                 except Exception as exc:
@@ -618,11 +711,17 @@ async def reparse_for_resume(
                 if i % 50 == 49:
                     await asyncio.sleep(0)
 
+    vb_results = await vb_task
+
     merged: dict[int, Any] = dict(cached_hits)
-    for (idx, _item, content_hash), result in zip(to_parse, parse_results, strict=True):
+    for (idx, _item, content_hash), result in zip(other_misses, parse_results, strict=True):
         merged[idx] = result
         if not isinstance(result, tuple | Exception):
             _cache_parsed(parse_cache, result, content_hash)
+    vb_hash_by_idx = {idx: h for idx, _item, h in vb_misses}
+    for idx, parsed in vb_results.items():
+        merged[idx] = parsed
+        _cache_parsed(parse_cache, parsed, vb_hash_by_idx[idx])
 
     for idx in range(len(fi_and_bytes)):
         fi, source = fi_and_bytes[idx]

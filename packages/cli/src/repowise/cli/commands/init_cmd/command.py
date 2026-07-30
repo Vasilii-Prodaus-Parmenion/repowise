@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
@@ -1176,7 +1177,7 @@ def init_command(
             # message above would otherwise send the user to set a key they
             # have already set.
             if "Could not set up" in str(exc):
-                console.print(f"  [dim]{exc}[/dim]")
+                console.print(f"  [dim]{escape(str(exc))}[/dim]")
         # resolve_provider / interactive provider selection may have just set
         # the API key in os.environ. Re-resolve the embedder so the
         # display (and the embed path below) honors the key the user just

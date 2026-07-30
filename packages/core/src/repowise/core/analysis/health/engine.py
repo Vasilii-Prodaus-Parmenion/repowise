@@ -725,6 +725,14 @@ class HealthAnalyzer:
             from .sql_complexity import walk_sql_file
 
             return walk_sql_file(pf.file_info, source)
+        if language == "vbnet":
+            # VB has no tree-sitter grammar either; its metrics were
+            # computed by the Roslyn sidecar during parsing and are looked
+            # up (not recomputed) here — see vb/complexity.py and
+            # vb-support.md §8.
+            from repowise.core.ingestion.vb.complexity import walk_vb_file
+
+            return walk_vb_file(pf.file_info, source)
         return walk_file(path, language, source)
 
     def _extract_method_analyses(
