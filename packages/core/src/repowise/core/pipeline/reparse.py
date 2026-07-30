@@ -44,15 +44,18 @@ def reparse_repo(
     file_infos = list(traverser.traverse())
     repo_structure = traverser.get_repo_structure()
 
-    parser = ASTParser()
+    parser = ASTParser(repo_path=Path(repo_path))
     parsed_files: list[Any] = []
     source_map: dict[str, bytes] = {}
-    for fi in file_infos:
-        try:
-            source = Path(fi.abs_path).read_bytes()
-            parsed = parser.parse_file(fi, source)
-            parsed_files.append(parsed)
-            source_map[fi.path] = source
-        except Exception:
-            pass  # unreadable / unparseable files are skipped, as in init
+    try:
+        for fi in file_infos:
+            try:
+                source = Path(fi.abs_path).read_bytes()
+                parsed = parser.parse_file(fi, source)
+                parsed_files.append(parsed)
+                source_map[fi.path] = source
+            except Exception:
+                pass  # unreadable / unparseable files are skipped, as in init
+    finally:
+        parser.close()
     return parsed_files, source_map, repo_structure

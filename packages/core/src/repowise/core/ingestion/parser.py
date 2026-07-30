@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 import structlog
 from tree_sitter import Language, Node, Parser
@@ -231,13 +232,38 @@ class ASTParser:
     That's it.  No Python class, no new module.
     """
 
-    def __init__(self) -> None:
-        pass
+    def __init__(self, repo_path: Path | str | None = None) -> None:
+        # Only needed for vbnet: locates/builds the Roslyn sidecar. None is
+        # fine for every other language, and for the bulk parse phase (VB
+        # files never reach this parser there — see _parse_one's guard).
+        self._repo_path = Path(repo_path) if repo_path is not None else None
+        self._vb_bridge: Any = None
+
+    def close(self) -> None:
+        """Release resources opened lazily by this parser (the VB sidecar bridge).
+
+        A no-op if no VB file was ever parsed. Callers that construct one
+        ``ASTParser`` for a whole loop of files (incremental.py, reparse.py)
+        should call this once after the loop.
+        """
+        if self._vb_bridge is not None:
+            self._vb_bridge.close()
+            self._vb_bridge = None
 
     def parse_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
         """Parse *source* bytes and return a fully populated ParsedFile."""
         lang = file_info.language
         content_hash = compute_content_hash(source)
+
+        # VB.NET has no tree-sitter grammar at all — its AST comes from a
+        # Roslyn sidecar (see ingestion/vb/). This path is for the two
+        # single-file synchronous callers (incremental.py, reparse.py) only;
+        # the bulk parse phase partitions .vb files out before they ever
+        # reach a ProcessPoolExecutor worker's ASTParser.
+        if lang == "vbnet":
+            parsed = self._parse_vb_file(file_info, source)
+            parsed.content_hash = content_hash
+            return parsed
 
         # Non-tree-sitter formats (OpenAPI, Dockerfile, Makefile, SQL) parse
         # via dedicated handlers. Checked before the grammar lookup: none of
@@ -397,6 +423,24 @@ class ASTParser:
             type_refs=type_refs,
             local_refs=local_refs,
         )
+
+    def _parse_vb_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
+        """Single-file VB parse via the Roslyn sidecar (D1, §5.2).
+
+        Lazily creates one :class:`VbSyncBridge` per ``ASTParser`` instance
+        so a caller's whole loop over files (incremental.py, reparse.py)
+        reuses one sidecar process rather than spawning one per file.
+        """
+        if self._repo_path is None:
+            raise RuntimeError(
+                "ASTParser must be constructed with repo_path=... to parse "
+                "VB.NET files (needed to locate/build the Roslyn sidecar)."
+            )
+        from repowise.core.ingestion.vb.sidecar import VbSyncBridge
+
+        if self._vb_bridge is None:
+            self._vb_bridge = VbSyncBridge(self._repo_path)
+        return self._vb_bridge.parse_one(file_info, source)
 
     # ------------------------------------------------------------------
     # Query loading

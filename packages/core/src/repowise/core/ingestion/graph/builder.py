@@ -452,6 +452,12 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         # conservative sibling edges so neither reads as orphaned.
         self._resolve_csharp_same_namespace(ctx, progress=progress)
 
+        # --- VB.NET same-namespace + project-Import implicit references ---
+        # Same gap as C#'s pass above, VB side: no Imports needed for
+        # same-effective-namespace types, and <Import Include=...> makes a
+        # namespace visible to every file in the project.
+        self._resolve_vb_same_namespace(ctx, progress=progress)
+
         # --- Swift intra-module type references ---
         # Swift files see same-target siblings with no import statement;
         # emit conservative type-reference edges per SPM target.

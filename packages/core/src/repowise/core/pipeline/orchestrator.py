@@ -243,6 +243,78 @@ async def run_pipeline(
     PipelineResult
         All pipeline outputs held in memory.
     """
+    resolved_repo_path = Path(repo_path).resolve()
+    try:
+        return await _run_pipeline_body(
+            resolved_repo_path,
+            commit_depth=commit_depth,
+            follow_renames=follow_renames,
+            skip_tests=skip_tests,
+            skip_infra=skip_infra,
+            exclude_patterns=exclude_patterns,
+            include_submodules=include_submodules,
+            include_nested_repos=include_nested_repos,
+            generate_docs=generate_docs,
+            llm_client=llm_client,
+            embedder=embedder,
+            vector_store=vector_store,
+            concurrency=concurrency,
+            test_run=test_run,
+            resume=resume,
+            mode=mode,
+            job_store=job_store,
+            progress=progress,
+            cost_tracker=cost_tracker,
+            generation_config=generation_config,
+            wiki_style=wiki_style,
+            existing_kg_fingerprint=existing_kg_fingerprint,
+            on_page_ready=on_page_ready,
+            resume_controller=resume_controller,
+            coverage_report_paths=coverage_report_paths,
+        )
+    finally:
+        # D6: the VB Roslyn sidecar is run-scoped to one run_pipeline() call.
+        # Tear it down here regardless of how the run ended (success, a
+        # raised exception, or a resume-checkpoint early return) — a repo
+        # with no .vb files never started one, so this is a no-op dict
+        # lookup for everyone else (vb-support.md §2 D6, §4.2).
+        from repowise.core.ingestion.vb.sidecar import shutdown_sidecar
+
+        await shutdown_sidecar(resolved_repo_path)
+
+
+async def _run_pipeline_body(
+    repo_path: Path | str,
+    *,
+    commit_depth: int = 500,
+    follow_renames: bool = False,
+    skip_tests: bool = False,
+    skip_infra: bool = False,
+    exclude_patterns: list[str] | None = None,
+    include_submodules: bool = False,
+    include_nested_repos: bool = False,
+    generate_docs: bool = False,
+    llm_client: Any | None = None,
+    embedder: Any | None = None,
+    vector_store: Any | None = None,
+    concurrency: int = 5,
+    test_run: bool = False,
+    resume: bool = False,
+    mode: OrchestratorMode = OrchestratorMode.STANDARD,
+    job_store: Any | None = None,
+    progress: ProgressCallback | None = None,
+    cost_tracker: Any | None = None,
+    generation_config: Any | None = None,
+    wiki_style: str | None = None,
+    existing_kg_fingerprint: str | None = None,
+    on_page_ready: Any | None = None,
+    resume_controller: ResumeController | None = None,
+    coverage_report_paths: list[Path] | None = None,
+) -> PipelineResult:
+    """Actual pipeline body — see :func:`run_pipeline` for the public
+    signature and docstring. Split out so the public entry point can wrap
+    every code path (success, exception, resume early-return) in a
+    ``finally`` that tears down the run-scoped VB sidecar (D6)."""
     repo_path = Path(repo_path).resolve()
     start = time.monotonic()
 

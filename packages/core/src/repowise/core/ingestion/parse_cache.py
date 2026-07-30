@@ -109,6 +109,20 @@ def parser_fingerprint() -> str:
             h.update(scm.read_bytes())
     except Exception:
         h.update(b"queries:unreadable")
+    try:
+        # VB has no .scm file to hash above (no tree-sitter grammar) — its
+        # extraction rules live in the Roslyn sidecar instead. Hashing the
+        # wire protocol version + a hash of the sidecar's own C# sources
+        # (not repowise_version, for the same "unrelated release must not
+        # churn the cache" reason PARSER_SCHEMA_VERSION is separate above)
+        # means a sidecar change invalidates cached VB parses the same way
+        # a .scm edit invalidates every other language's.
+        from repowise.core.ingestion.vb.build import PROTOCOL_VERSION, sidecar_src_fingerprint
+
+        h.update(f"vb-protocol:{PROTOCOL_VERSION}".encode())
+        h.update(f"vb-src:{sidecar_src_fingerprint()}".encode())
+    except Exception:
+        h.update(b"vb-sidecar:unreadable")
     return h.hexdigest()
 
 

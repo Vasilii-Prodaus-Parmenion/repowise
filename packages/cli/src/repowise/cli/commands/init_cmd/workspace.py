@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from repowise.cli._setup import setup_logging_silence
@@ -339,7 +340,7 @@ def _ingest_and_generate_repo(repo: Any, idx: int, total: int, ctx: _WorkspaceCt
             f"    [green]✓[/green] {result.file_count:,} files, {result.symbol_count:,} symbols"
         )
     except Exception as exc:
-        console.print(f"    [{ERR}]✗ Failed: {exc}[/]\n")
+        console.print(f"    [{ERR}]✗ Failed: {escape(str(exc))}[/]\n")
         return _RepoOutcome(error=str(exc))
 
     provider = ctx.provider
@@ -537,7 +538,7 @@ def _run_cross_repo_analysis(ws_config: Any, root: Any, selected: list[Any], err
             run_async(run_cross_repo_hooks(ws_config, root, indexed_aliases))
             console.print("  [green]✓[/green] Cross-repo analysis complete")
         except Exception as exc:
-            console.print(f"  [yellow]⚠ Cross-repo analysis failed: {exc}[/yellow]")
+            console.print(f"  [yellow]⚠ Cross-repo analysis failed: {escape(str(exc))}[/yellow]")
 
 
 def _workspace_init(

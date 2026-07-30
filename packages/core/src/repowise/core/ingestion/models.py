@@ -38,6 +38,9 @@ LanguageTag = Literal[
     "scala",
     "luau",
     "dart",
+    # VB.NET: AST comes from a Roslyn sidecar, not tree-sitter (no scm_file,
+    # no LANGUAGE_CONFIGS entry — see ingestion/vb/ and vb-support.md).
+    "vbnet",
     # Passthrough code languages (no AST parser yet — empty ParsedFile,
     # files enter the graph via the generic resolver). Before these tags
     # existed the traverser silently skipped such files as unknown, so e.g.
@@ -73,6 +76,9 @@ LanguageTag = Literal[
     "xaml",
     # Markup with no symbols, but <script src>/<link href> are real edges.
     "html",
+    # ASP.NET Web Forms markup (.aspx/.ascx/.master) — same passthrough
+    # shape as xaml; see languages/specs/aspx.py and dynamic_hints/webforms.py.
+    "aspx",
     "unknown",
 ]
 

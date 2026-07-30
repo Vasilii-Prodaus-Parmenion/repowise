@@ -263,6 +263,10 @@ LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
             }
         ),
     ),
+    # No "vbnet" entry here, on purpose: VB.NET has no tree-sitter grammar,
+    # so it can never reach this tree-sitter-driven config table. Its AST
+    # comes from a Roslyn sidecar instead (ingestion/vb/), dispatched
+    # around LANGUAGE_CONFIGS entirely — see docs/architecture/vb-support.md.
     "swift": LanguageConfig(
         symbol_node_types={
             "class_declaration": "class",

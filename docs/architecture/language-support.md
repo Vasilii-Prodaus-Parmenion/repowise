@@ -354,6 +354,39 @@ The same steps would fit Astro components; only the locator changes.
 
 ---
 
+## Languages without a grammar
+
+The recipe above assumes step 3 (a tree-sitter `.scm` query file) always
+exists — true for every language except **VB.NET**, whose AST comes from a
+long-lived Roslyn (`Microsoft.CodeAnalysis.VisualBasic`) sidecar process
+instead. There is no maintained, packaged tree-sitter VB.NET grammar, and
+VB's own grammar (statement-terminated blocks, significant line
+continuations, case-insensitive identifiers, `Handles` clauses) is hostile
+to the tree-sitter style regardless.
+
+`languages/specs/vbnet.py` still exists — `grammar_package` and `scm_file`
+are simply `None`, and `language_configs.py` carries a comment at the point
+where every other language has a `LANGUAGE_CONFIGS` entry, explaining the
+absence so it doesn't read as an oversight. Everywhere else in the pipeline,
+VB looks like any other language: `ASTParser.parse_file` dispatches it to
+the sidecar client instead of a grammar lookup (mirroring the `sql`
+special-handler branch), and the resulting `ParsedFile` carries the same
+`Symbol`/`Import`/`CallSite`/`HeritageRelation` shapes every tree-sitter
+language produces — nothing downstream (`GraphBuilder`, `CallResolver`,
+dead-code analysis, health) needs to know the AST came from a different
+process entirely.
+
+The full design — the sidecar protocol, the first-use `dotnet build` cache,
+the preflight SDK check, case-insensitive symbol identity, `Handles`/
+`AddHandler` event-wiring edges, and the code-health metrics contract — is
+its own document: [architecture/vb-support.md](vb-support.md). Read it
+before routing a second non-tree-sitter language (e.g. C# through Roslyn,
+which the sidecar's wire protocol already allows for but this work does not
+do) through the same seam — the protocol is deliberately language-neutral
+in shape for exactly that reason.
+
+---
+
 ## Optional language-specific passes
 
 Several pluggable hooks let a language opt into deeper resolution without

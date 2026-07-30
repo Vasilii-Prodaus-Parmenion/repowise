@@ -146,6 +146,7 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "repowise.core.ingestion" = ["queries/*.scm"]
+"repowise.core.ingestion.vb" = ["sidecar_src/*"]
 "repowise.core.generation" = ["templates/*.j2"]
 # Bundled copy of docs/CHANGELOG.md so the CLI `whats-new` / post-upgrade panel
 # and the web what's-new view work offline from the installed wheel. Lives in

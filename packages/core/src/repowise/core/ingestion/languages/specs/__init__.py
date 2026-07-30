@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from ..spec import LanguageSpec
 from .asciidoc import SPEC as _ASCIIDOC
+from .aspx import SPEC as _ASPX
 from .c import SPEC as _C
 from .clojure import SPEC as _CLOJURE
 from .cpp import SPEC as _CPP
@@ -56,6 +57,7 @@ from .terraform import SPEC as _TERRAFORM
 from .toml import SPEC as _TOML
 from .typescript import SPEC as _TYPESCRIPT
 from .unknown import SPEC as _UNKNOWN
+from .vbnet import SPEC as _VBNET
 from .vue import SPEC as _VUE
 from .xaml import SPEC as _XAML
 from .yaml import SPEC as _YAML
@@ -87,6 +89,11 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     _KOTLIN,
     _RUBY,
     _CSHARP,
+    # VB.NET: AST comes from a Roslyn sidecar, not tree-sitter — no grammar
+    # to slot in, but symbols/imports/calls/heritage are real (see
+    # docs/architecture/vb-support.md), so it groups with the other
+    # traversal-tier .NET languages rather than the passthrough section.
+    _VBNET,
     _PHP,
     _SWIFT,
     _SCALA,
@@ -117,6 +124,9 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     # emits ``dynamic_uses`` edges to bound C# types. Registered here so
     # that the traverser surfaces a file node these edges can attach to.
     _XAML,
+    # ASP.NET Web Forms markup (.aspx/.ascx/.master) — same shape as XAML,
+    # see specs/aspx.py and dynamic_hints/webforms.py.
+    _ASPX,
     # -----------------------------------------------------------------
     # Extra languages — git blame coverage only (passthrough + is_code)
     # These exist so git_indexer tracks their history even though

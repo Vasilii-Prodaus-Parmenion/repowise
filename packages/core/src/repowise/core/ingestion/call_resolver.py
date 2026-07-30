@@ -40,6 +40,18 @@ def _file_language(parsed_files: dict[str, ParsedFile], symbol_id: str) -> str |
     return parsed.file_info.language if parsed else None
 
 
+def _norm_key(name: str, language: str | None) -> str:
+    """Casefold *name* for VB.NET's case-insensitive identifiers.
+
+    VB matches ``FooBar``/``foobar``/``FOOBAR`` as the same declaration, and
+    real codebases are inconsistent about which casing they call it with
+    (vb-support.md §5.5). Every other language keeps its exact-case key —
+    this only touches lookup/index keys, never ``Symbol.name`` itself, so
+    display casing is unaffected.
+    """
+    return name.casefold() if language == "vbnet" else name
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedCall:
     """A call resolved to concrete symbol IDs with a confidence score."""
@@ -396,21 +408,22 @@ class CallResolver:
         (Import-name maps are shared — see ``import_index.build_import_name_maps``.)
         """
         for path, parsed in parsed_files.items():
+            lang = parsed.file_info.language
             file_syms: dict[str, str] = {}
             file_methods: dict[tuple[str, str], str] = {}
 
             for sym in parsed.symbols:
                 # File-level symbol index (top-level symbols and methods)
-                file_syms[sym.name] = sym.id
+                file_syms[_norm_key(sym.name, lang)] = sym.id
 
                 # Method index: (class_name, method_name) → symbol_id
                 if sym.parent_name:
-                    key = (sym.parent_name, sym.name)
+                    key = (_norm_key(sym.parent_name, lang), _norm_key(sym.name, lang))
                     file_methods[key] = sym.id
                     self._global_methods[key].append((path, sym.id))
 
                 # Global indices
-                self._global_symbols[sym.name].append(sym.id)
+                self._global_symbols[_norm_key(sym.name, lang)].append(sym.id)
 
             self._file_symbols[path] = file_syms
             self._file_methods[path] = file_methods
@@ -486,11 +499,13 @@ class CallResolver:
     ) -> ResolvedCall | None:
         """Resolve a free function call (no receiver)."""
         target_name = call.target_name
+        caller_lang = _file_language(self._parsed_files, file_path)
+        key = _norm_key(target_name, caller_lang)
 
         # Tier 1: same-file
         file_syms = self._file_symbols.get(file_path, {})
-        if target_name in file_syms:
-            callee_id = file_syms[target_name]
+        if key in file_syms:
+            callee_id = file_syms[key]
             if callee_id != caller_id:  # no self-recursion edges for now
                 return ResolvedCall(caller_id, callee_id, 0.95, call.line)
 
@@ -519,12 +534,12 @@ class CallResolver:
 
         # Tier 2: import-scoped
         # 2a: Check specific imported name → source file (binding-aware)
-        binding = self._import_bindings.get(file_path, {}).get(target_name)
+        binding = self._import_bindings.get(file_path, {}).get(key)
         if binding and binding.source_file:
             source_file = binding.source_file
             # Follow barrel re-export one hop
             barrel = self._barrel_origins.get(source_file, {})
-            lookup_name = binding.exported_name or target_name
+            lookup_name = _norm_key(binding.exported_name or target_name, caller_lang)
             if lookup_name in barrel:
                 source_file = barrel[lookup_name]
             source_syms = self._file_symbols.get(source_file, {})
@@ -533,24 +548,23 @@ class CallResolver:
 
         # 2a fallback: plain _import_names (for imports without binding data)
         name_to_file = self._import_names.get(file_path, {})
-        if target_name in name_to_file and not binding:
-            source_file = name_to_file[target_name]
+        if key in name_to_file and not binding:
+            source_file = name_to_file[key]
             barrel = self._barrel_origins.get(source_file, {})
-            if target_name in barrel:
-                source_file = barrel[target_name]
+            if key in barrel:
+                source_file = barrel[key]
             source_syms = self._file_symbols.get(source_file, {})
-            if target_name in source_syms:
-                return ResolvedCall(caller_id, source_syms[target_name], 0.90, call.line)
+            if key in source_syms:
+                return ResolvedCall(caller_id, source_syms[key], 0.90, call.line)
 
         # 2b: Check all imported files for the symbol (pre-merged lookup)
         merged_syms = self._merged_symbols_for(file_path)
-        if target_name in merged_syms:
-            return ResolvedCall(caller_id, merged_syms[target_name], 0.85, call.line)
+        if key in merged_syms:
+            return ResolvedCall(caller_id, merged_syms[key], 0.85, call.line)
 
         # Tier 3: global unique match — only within the same language
-        candidates = self._global_symbols.get(target_name, [])
+        candidates = self._global_symbols.get(key, [])
         if len(candidates) == 1 and candidates[0] != caller_id:
-            caller_lang = _file_language(self._parsed_files, caller_id)
             callee_lang = _file_language(self._parsed_files, candidates[0])
             if caller_lang and callee_lang and caller_lang != callee_lang:
                 return None  # reject cross-language Tier 3 match
@@ -568,6 +582,9 @@ class CallResolver:
         receiver_name = call.receiver_name
         method_name = call.target_name
         assert receiver_name is not None
+        caller_lang = _file_language(self._parsed_files, file_path)
+        receiver_key = _norm_key(receiver_name, caller_lang)
+        method_key = _norm_key(method_name, caller_lang)
 
         # Go: ``pkg.Func()`` where ``pkg`` is an import alias resolves to the
         # function in *any* file of that package, not just the single
@@ -594,19 +611,19 @@ class CallResolver:
                         return ResolvedCall(caller_id, methods[key], 0.88, call.line)
 
         # Strategy 1: receiver is a module alias (e.g. "import models" → "models.User()")
-        module_file = self._module_aliases.get(file_path, {}).get(receiver_name)
+        module_file = self._module_aliases.get(file_path, {}).get(receiver_key)
         if module_file:
             source_syms = self._file_symbols.get(module_file, {})
-            if method_name in source_syms:
-                return ResolvedCall(caller_id, source_syms[method_name], 0.88, call.line)
+            if method_key in source_syms:
+                return ResolvedCall(caller_id, source_syms[method_key], 0.88, call.line)
 
         # Strategy 1b: receiver in import names (non-alias fallback for backward compat)
         name_to_file = self._import_names.get(file_path, {})
-        if receiver_name in name_to_file and not module_file:
-            source_file = name_to_file[receiver_name]
+        if receiver_key in name_to_file and not module_file:
+            source_file = name_to_file[receiver_key]
             source_syms = self._file_symbols.get(source_file, {})
-            if method_name in source_syms:
-                return ResolvedCall(caller_id, source_syms[method_name], 0.88, call.line)
+            if method_key in source_syms:
+                return ResolvedCall(caller_id, source_syms[method_key], 0.88, call.line)
 
         # Strategy 1c: Rust crate-scoped reference (e.g. typst_html::module)
         # The receiver is a crate name, the target is a symbol in that crate's lib.rs
@@ -621,7 +638,7 @@ class CallResolver:
         # Strategy 2: receiver is a known class name → look for method on that class
         # Check same-file classes first
         file_methods = self._file_methods.get(file_path, {})
-        key = (receiver_name, method_name)
+        key = (receiver_key, method_key)
         if key in file_methods:
             return ResolvedCall(caller_id, file_methods[key], 0.93, call.line)
 
@@ -646,13 +663,14 @@ class CallResolver:
         if receiver_name in ("self", "this"):
             caller_class = _extract_class_from_symbol_id(caller_id)
             if caller_class:
+                caller_class_key = _norm_key(caller_class, caller_lang)
                 for (cls_name, meth_name), sym_id in self._file_methods.get(
                     file_path, {}
                 ).items():
                     if (
-                        meth_name == method_name
+                        meth_name == method_key
                         and sym_id != caller_id
-                        and cls_name == caller_class
+                        and cls_name == caller_class_key
                     ):
                         return ResolvedCall(caller_id, sym_id, 0.95, call.line)
 

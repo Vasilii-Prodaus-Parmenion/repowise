@@ -39,6 +39,7 @@ from .rust import RustDynamicHints
 from .scala import ScalaDynamicHints
 from .spring import SpringDynamicHints
 from .swift import SwiftDynamicHints
+from .webforms import WebFormsDynamicHints
 from .xaml import XamlDynamicHints
 
 log = structlog.get_logger(__name__)
@@ -56,6 +57,14 @@ class HintRegistry:
         *,
         max_workers: int | None = None,
     ) -> None:
+        # Local import: vb.handles reaches back into this package
+        # (dynamic_hints.base) for DynamicEdge/DynamicHintExtractor, so a
+        # module-level import here would deadlock the two packages'
+        # __init__ chains on whichever one is imported first. Deferring to
+        # construction time is enough — by then dynamic_hints.base has
+        # always already finished loading.
+        from repowise.core.ingestion.vb.handles import VbHandlesDynamicHints
+
         self._extractors = extractors or [
             DjangoDynamicHints(),
             PytestDynamicHints(),
@@ -75,6 +84,8 @@ class HintRegistry:
             LuauDynamicHints(),
             GoDynamicHints(),
             RustDynamicHints(),
+            VbHandlesDynamicHints(),
+            WebFormsDynamicHints(),
         ]
         self._max_workers = max_workers or min(_DEFAULT_MAX_WORKERS, len(self._extractors))
 

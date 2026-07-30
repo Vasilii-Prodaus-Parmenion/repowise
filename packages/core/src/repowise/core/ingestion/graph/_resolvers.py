@@ -39,9 +39,7 @@ class ResolveMixin:
         )
         total_resolved = 0
 
-        files_with_heritage = [
-            (p, pf) for p, pf in self._parsed_files.items() if pf.heritage
-        ]
+        files_with_heritage = [(p, pf) for p, pf in self._parsed_files.items() if pf.heritage]
         if progress:
             progress.on_phase_start("graph.heritage", len(files_with_heritage))
         for path, parsed in files_with_heritage:
@@ -83,9 +81,7 @@ class ResolveMixin:
             resolve_csharp_member_reads,
         )
 
-        has_csharp = any(
-            pf.file_info.language == "csharp" for pf in self._parsed_files.values()
-        )
+        has_csharp = any(pf.file_info.language == "csharp" for pf in self._parsed_files.values())
         if not has_csharp:
             return
 
@@ -158,9 +154,7 @@ class ResolveMixin:
         )
         from ..resolvers.dotnet import get_or_build_index
 
-        has_csharp = any(
-            pf.file_info.language == "csharp" for pf in self._parsed_files.values()
-        )
+        has_csharp = any(pf.file_info.language == "csharp" for pf in self._parsed_files.values())
         if not has_csharp:
             return
 
@@ -171,12 +165,45 @@ class ResolveMixin:
             index = get_or_build_index(ctx)
             cs_texts = collect_csharp_source_texts(self._parsed_files)
             repo = getattr(index, "repo_path", None) if index is not None else None
-            added = resolve_csharp_same_namespace_refs(
-                self._graph, index, cs_texts, repo
-            )
+            added = resolve_csharp_same_namespace_refs(self._graph, index, cs_texts, repo)
             log.info("same_namespace_edges", language="csharp", added=added)
         except Exception as exc:
             log.warning("csharp_same_namespace_failed", error=str(exc))
+        finally:
+            if progress:
+                done = getattr(progress, "on_phase_done", None)
+                if callable(done):
+                    done(phase)
+
+    def _resolve_vb_same_namespace(self, ctx: Any, progress: Any | None = None) -> None:
+        """Emit same-namespace / project-Import ``imports`` edges for VB files.
+
+        VB references same-effective-namespace types with no ``Imports``
+        directive, and a project-level ``<Import Include=...>`` item makes a
+        namespace visible project-wide — same gap the C# pass closes, VB
+        side (vb-support.md §7).
+        """
+        from ..languages.vb_same_namespace import (
+            collect_vb_source_texts,
+            resolve_vb_same_namespace_refs,
+        )
+        from ..resolvers.dotnet import get_or_build_index
+
+        has_vb = any(pf.file_info.language == "vbnet" for pf in self._parsed_files.values())
+        if not has_vb:
+            return
+
+        phase = "graph.vb_same_namespace"
+        if progress:
+            progress.on_phase_start(phase, None)
+        try:
+            index = get_or_build_index(ctx)
+            vb_texts = collect_vb_source_texts(self._parsed_files)
+            repo = getattr(index, "repo_path", None) if index is not None else None
+            added = resolve_vb_same_namespace_refs(self._graph, index, vb_texts, repo)
+            log.info("same_namespace_edges", language="vbnet", added=added)
+        except Exception as exc:
+            log.warning("vb_same_namespace_failed", error=str(exc))
         finally:
             if progress:
                 done = getattr(progress, "on_phase_done", None)
@@ -193,11 +220,7 @@ class ResolveMixin:
         source tree: ``<root>/spec/<sub>/<name>_spec.rb`` tests
         ``<root>/<sub>/<name>.rb`` (or ``<root>/lib/<sub>/<name>.rb``).
         """
-        ruby_files = [
-            p
-            for p, pf in self._parsed_files.items()
-            if pf.file_info.language == "ruby"
-        ]
+        ruby_files = [p for p, pf in self._parsed_files.items() if pf.file_info.language == "ruby"]
         if not ruby_files:
             return
 
@@ -254,9 +277,7 @@ class ResolveMixin:
         source_exts = (".c", ".cc", ".cpp", ".cxx", ".c++")
 
         cpp_files = [
-            p
-            for p, pf in self._parsed_files.items()
-            if pf.file_info.language in ("c", "cpp")
+            p for p, pf in self._parsed_files.items() if pf.file_info.language in ("c", "cpp")
         ]
         if not cpp_files:
             return
@@ -317,9 +338,7 @@ class ResolveMixin:
         """
         from ..resolvers.dotnet import get_or_build_index
 
-        has_csharp = any(
-            pf.file_info.language == "csharp" for pf in self._parsed_files.values()
-        )
+        has_csharp = any(pf.file_info.language == "csharp" for pf in self._parsed_files.values())
         if not has_csharp:
             return
 
@@ -378,9 +397,7 @@ class ResolveMixin:
         )
         from ..resolvers.swift_spm import get_or_build_swift_targets
 
-        has_swift = any(
-            pf.file_info.language == "swift" for pf in self._parsed_files.values()
-        )
+        has_swift = any(pf.file_info.language == "swift" for pf in self._parsed_files.values())
         if not has_swift:
             return
 
@@ -411,9 +428,7 @@ class ResolveMixin:
         """
         from ..languages.fsharp_compile_order import add_fsharp_compile_order_edges
 
-        has_fsharp = any(
-            pf.file_info.language == "fsharp" for pf in self._parsed_files.values()
-        )
+        has_fsharp = any(pf.file_info.language == "fsharp" for pf in self._parsed_files.values())
         if not has_fsharp or ctx.repo_path is None:
             return
 
@@ -447,9 +462,7 @@ class ResolveMixin:
             resolve_go_interface_satisfaction,
         )
 
-        has_go = any(
-            pf.file_info.language == "go" for pf in self._parsed_files.values()
-        )
+        has_go = any(pf.file_info.language == "go" for pf in self._parsed_files.values())
         if not has_go:
             return
 
@@ -483,9 +496,7 @@ class ResolveMixin:
         )
         total_resolved = 0
 
-        files_with_calls = [
-            (p, pf) for p, pf in self._parsed_files.items() if pf.calls
-        ]
+        files_with_calls = [(p, pf) for p, pf in self._parsed_files.items() if pf.calls]
         if progress:
             progress.on_phase_start("graph.calls", len(files_with_calls))
         for path, parsed in files_with_calls:

@@ -644,6 +644,12 @@ Anonymous usage telemetry is **enabled by default** (opt-out).
 | `REPOWISE_TELEMETRY_DISABLED` | Disables telemetry, repowise-specific |
 | `REPOWISE_TELEMETRY_DEBUG` | Prints the telemetry payload to stderr instead of sending it |
 
+### Ingestion
+
+| Variable | Description |
+|----------|-------------|
+| `REPOWISE_ROSLYN_SIDECAR` | Path to a prebuilt VB.NET Roslyn sidecar directory (containing `RepowiseVb.dll`), skipping the first-use `dotnet build`. For air-gapped installs, CI images that pre-seed it, and local sidecar development. See [architecture/vb-support.md](../architecture/vb-support.md#44-first-use-build-d2) |
+
 ### Misc
 
 | Variable | Description |

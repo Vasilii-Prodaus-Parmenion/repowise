@@ -390,6 +390,17 @@ class MetricsMixin:
         """
         import asyncio as _asyncio
 
+        # pagerank/betweenness/communities each lazily import numpy/scipy on
+        # first use (networkx's own pattern). Importing them here, on this
+        # thread, before fanning out is load-bearing: two worker threads
+        # triggering that first import at once race CPython's import lock
+        # around numpy's C-extension init and have been observed to crash
+        # the whole process (access violation in numpy's getlimits.py) on at
+        # least one MinGW-built numpy. Once sys.modules is populated, every
+        # thread's import below is a cheap no-op — no race.
+        import numpy  # noqa: F401
+        import scipy  # noqa: F401
+
         await _asyncio.gather(
             _asyncio.to_thread(self.pagerank),
             _asyncio.to_thread(self.betweenness_centrality),
