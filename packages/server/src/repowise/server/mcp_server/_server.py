@@ -552,10 +552,34 @@ def create_mcp_server(
     return mcp
 
 
+def _configure_network_binding(host: str) -> None:
+    """Apply ``host`` to the shared FastMCP instance for network transports.
+
+    ``mcp`` is constructed once at import time with the default host
+    (``127.0.0.1``), so FastMCP's own constructor-time DNS-rebinding
+    auto-detection (``enable_dns_rebinding_protection=True`` only when host
+    is loopback) already ran against that default before any CLI argument was
+    known. Mirror that same rule here, now that the real host is known:
+    binding a non-loopback host is an explicit deployment choice, so disable
+    the loopback-only protection exactly as FastMCP's own ``__init__`` would
+    have, had it been constructed with this host to begin with. Callers that
+    bind non-loopback are expected to gate access at the network layer
+    instead (firewall, VPN, or cloud ingress IP restriction).
+    """
+    mcp.settings.host = host
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+
+
 def run_mcp(
     transport: str = "stdio",
     repo_path: str | None = None,
     port: int = 7338,
+    host: str = "127.0.0.1",
     tools: str | list[str] | None = None,
 ) -> None:
     """Run the MCP server with the specified transport.
@@ -563,6 +587,10 @@ def run_mcp(
     ``tools`` overrides which tools are advertised (see
     :func:`repowise.server.mcp_server._tool_selection.apply_tool_selection`);
     when omitted, the ``mcp.tools`` config block is honoured.
+
+    ``host`` only applies to the ``sse``/``streamable-http`` transports
+    (``stdio`` has no network listener). Defaults to ``127.0.0.1``; see
+    :func:`_configure_network_binding` for what changes when it's overridden.
     """
     _state._repo_path = repo_path
     from repowise.server.mcp_server._tool_selection import apply_tool_selection
@@ -571,9 +599,11 @@ def run_mcp(
 
     if transport == "sse":
         mcp.settings.port = port
+        _configure_network_binding(host)
         mcp.run(transport="sse")
     elif transport == "streamable-http":
         mcp.settings.port = port
+        _configure_network_binding(host)
         mcp.run(transport="streamable-http")
     else:
         # stdout is the JSON-RPC channel on stdio, so every log line written
