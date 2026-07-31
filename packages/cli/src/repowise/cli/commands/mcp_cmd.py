@@ -46,13 +46,15 @@ def _print_network_startup(
     transport: str,
     repo_path: Path,
     port: int,
+    host: str,
     workspace: dict[str, object] | None,
 ) -> None:
     label = "streamable HTTP" if transport == "streamable-http" else "SSE"
     endpoint = "mcp" if transport == "streamable-http" else "sse"
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
     console.print(
         f"[bold green]Starting repowise MCP server ({label})[/bold green]\n"
-        f"URL: http://127.0.0.1:{port}/{endpoint}"
+        f"URL: http://{display_host}:{port}/{endpoint}"
     )
 
     if workspace is not None:
@@ -85,6 +87,18 @@ def _print_network_startup(
     help="Port for HTTP/SSE transports (default: 7338).",
 )
 @click.option(
+    "--host",
+    default="127.0.0.1",
+    help=(
+        "Bind host for HTTP/SSE transports (default: 127.0.0.1, loopback-only). "
+        "Set to 0.0.0.0 to accept connections from other machines. Doing so "
+        "also disables the built-in DNS-rebinding protection (which only "
+        "makes sense for loopback), so only bind non-loopback behind your "
+        "own network-level access control (firewall, VPN, or cloud ingress "
+        "IP restriction)."
+    ),
+)
+@click.option(
     "--tools",
     default=None,
     help=(
@@ -106,6 +120,7 @@ def mcp_command(
     path: str | None,
     transport: str,
     port: int,
+    host: str,
     tools: str | None,
     all_tools: bool,
 ) -> None:
@@ -146,7 +161,7 @@ def mcp_command(
         )
 
     if transport in {"sse", "streamable-http"}:
-        _print_network_startup(transport, repo_path, port, workspace)
+        _print_network_startup(transport, repo_path, port, host, workspace)
     else:
         # stdio mode — no console output (it would corrupt the protocol)
         pass
@@ -159,5 +174,6 @@ def mcp_command(
         transport=transport,
         repo_path=str(repo_path),
         port=port,
+        host=host,
         tools=tools_override,
     )
