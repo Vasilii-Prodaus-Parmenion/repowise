@@ -21,6 +21,7 @@ from typing import Any
 
 from repowise.core.workspace.config import (
     WORKSPACE_DATA_DIR,
+    ContractConfig,
     WorkspaceConfig,
     ensure_workspace_data_dir,
 )
@@ -670,6 +671,60 @@ def load_contract_store(workspace_root: Path) -> ContractStore | None:
 # ---------------------------------------------------------------------------
 
 
+async def extract_repo_contracts(
+    alias: str,
+    repo_path: Path,
+    contract_config: ContractConfig,
+) -> list[Contract]:
+    """Extract one repo's contracts from a plain filesystem path.
+
+    No DB, no pipeline/orchestrator coupling — ``repo_path`` can be any checkout
+    (a normal working copy, or a git worktree checked out to an arbitrary
+    branch/PR). Used both by :func:`run_contract_extraction` (all repos, from
+    their indexed workspace paths) and by ``repowise workspace check-impact``
+    (one repo, from a caller-supplied path), which re-extracts a single repo's
+    contracts and merges them into an otherwise-persisted :class:`ContractStore`
+    before matching/diffing.
+    """
+    from .extractors import (
+        DataExtractor,
+        GrpcExtractor,
+        HttpExtractor,
+        SocketExtractor,
+        TopicExtractor,
+        assign_service,
+        detect_service_boundaries,
+    )
+    from .extractors.base import make_exclude_predicate
+
+    exclude = make_exclude_predicate(tuple(contract_config.exclude_globs))
+    contracts: list[Contract] = []
+
+    # Service boundary detection
+    boundaries = await asyncio.to_thread(detect_service_boundaries, repo_path)
+
+    # Run enabled extractors
+    extractors = []
+    if contract_config.detect_http:
+        extractors.append(HttpExtractor())
+    if contract_config.detect_grpc:
+        extractors.append(GrpcExtractor())
+    if contract_config.detect_socket:
+        extractors.append(SocketExtractor())
+    if contract_config.detect_topics:
+        extractors.append(TopicExtractor())
+    if contract_config.detect_data:
+        extractors.append(DataExtractor())
+
+    for extractor in extractors:
+        found = await asyncio.to_thread(extractor.extract, repo_path, alias, exclude)
+        for c in found:
+            c.service = assign_service(c.file_path, boundaries)
+        contracts.extend(found)
+
+    return contracts
+
+
 async def run_contract_extraction(
     ws_config: WorkspaceConfig,
     workspace_root: Path,
@@ -686,19 +741,7 @@ async def run_contract_extraction(
     5. Merge manual links from ``WorkspaceConfig``
     6. Save ``contracts.json``
     """
-    from .extractors import (
-        DataExtractor,
-        GrpcExtractor,
-        HttpExtractor,
-        SocketExtractor,
-        TopicExtractor,
-        assign_service,
-        detect_service_boundaries,
-    )
-    from .extractors.base import make_exclude_predicate
-
     contract_config = ws_config.contracts
-    exclude = make_exclude_predicate(tuple(contract_config.exclude_globs))
 
     # Build repo_paths — only include repos that have been indexed
     # (have a .repowise/ directory). Non-indexed repos must not participate
@@ -712,36 +755,11 @@ async def run_contract_extraction(
     if len(repo_paths) < 2:
         return ContractStore()
 
-    # Per-repo extraction
-    async def _extract_one_repo(alias: str, repo_path: Path) -> list[Contract]:
-        contracts: list[Contract] = []
-
-        # Service boundary detection
-        boundaries = await asyncio.to_thread(detect_service_boundaries, repo_path)
-
-        # Run enabled extractors
-        extractors = []
-        if contract_config.detect_http:
-            extractors.append(HttpExtractor())
-        if contract_config.detect_grpc:
-            extractors.append(GrpcExtractor())
-        if contract_config.detect_socket:
-            extractors.append(SocketExtractor())
-        if contract_config.detect_topics:
-            extractors.append(TopicExtractor())
-        if contract_config.detect_data:
-            extractors.append(DataExtractor())
-
-        for extractor in extractors:
-            found = await asyncio.to_thread(extractor.extract, repo_path, alias, exclude)
-            for c in found:
-                c.service = assign_service(c.file_path, boundaries)
-            contracts.extend(found)
-
-        return contracts
-
     results = await asyncio.gather(
-        *[_extract_one_repo(alias, path) for alias, path in repo_paths.items()]
+        *[
+            extract_repo_contracts(alias, path, contract_config)
+            for alias, path in repo_paths.items()
+        ]
     )
     all_contracts: list[Contract] = []
     for repo_contracts in results:
