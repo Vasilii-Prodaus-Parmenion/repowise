@@ -27,7 +27,9 @@ _log = logging.getLogger("repowise.workspace.extractors.topic")
 # Constants
 # ---------------------------------------------------------------------------
 
-_EXTENSIONS = _LANG_REGISTRY.extensions_for(["python", "typescript", "javascript", "java", "go"])
+_EXTENSIONS = _LANG_REGISTRY.extensions_for(
+    ["python", "typescript", "javascript", "java", "go", "csharp"]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +213,42 @@ _NATS_PATTERNS: list[_PatternDef] = [
     ),
 ]
 
-_ALL_PATTERNS = _KAFKA_PATTERNS + _RABBITMQ_PATTERNS + _NATS_PATTERNS
+# --- MassTransit (C#) ---
+# Typed pub/sub: consumers implement IConsumer<TMessage>; publishers call
+# bus.Publish<TMessage>(...) or bus.Publish(new TMessage { ... }) (inferred
+# generic). The message type name itself is the topic/contract identity.
+
+_MASSTRANSIT_PATTERNS: list[_PatternDef] = [
+    # class TradeSettledConsumer : IConsumer<TradeSettled>
+    _PatternDef(
+        regex=re.compile(r"""class\s+\w+\s*:\s*.*IConsumer<(\w+)>"""),
+        role="consumer",
+        broker="masstransit",
+        confidence=0.8,
+        topic_group=1,
+        label="IConsumer<T>",
+    ),
+    # bus.Publish<TradeSettled>(...)
+    _PatternDef(
+        regex=re.compile(r"""\.Publish(?:Async)?\s*<(\w+)>"""),
+        role="provider",
+        broker="masstransit",
+        confidence=0.8,
+        topic_group=1,
+        label="Publish<T>",
+    ),
+    # bus.Publish(new TradeSettled { ... }) (inferred generic)
+    _PatternDef(
+        regex=re.compile(r"""\.Publish(?:Async)?\s*\(\s*new\s+(\w+)"""),
+        role="provider",
+        broker="masstransit",
+        confidence=0.75,
+        topic_group=1,
+        label="Publish(new T)",
+    ),
+]
+
+_ALL_PATTERNS = _KAFKA_PATTERNS + _RABBITMQ_PATTERNS + _NATS_PATTERNS + _MASSTRANSIT_PATTERNS
 
 
 # ---------------------------------------------------------------------------
