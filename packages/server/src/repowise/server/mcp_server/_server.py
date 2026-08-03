@@ -398,6 +398,15 @@ mcp = FastMCP(
         "do not run it yourself."
     ),
     lifespan=_lifespan,
+    # Stateless HTTP + plain JSON responses (no SSE session multiplexing):
+    # the SSE/session-based streamable-http path was breaking with
+    # anyio.BrokenResourceError on writer.send() when fronted by a reverse
+    # proxy (Caddy) on Azure Container Apps — the response's memory-object
+    # stream reader closed before the writer could deliver, for reasons not
+    # pinned down further. stateless_http avoids that multiplexing entirely;
+    # json_response returns a direct JSON body instead of an SSE stream.
+    stateless_http=True,
+    json_response=True,
 )
 
 
