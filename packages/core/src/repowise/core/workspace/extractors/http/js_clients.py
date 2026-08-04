@@ -38,7 +38,7 @@ _AXIOS_RE = re.compile(
 # Wrapper call: IDENT("<url>" | `<url>`, ...) where the URL literal is concrete,
 # i.e. starts with `/`, a `${...}` base placeholder, or a scheme.
 _WRAPPER_CALL_RE = re.compile(
-    r"""\b(\w+)\s*\(\s*['"`]((?:/|\$\{|https?:)[^'"`]*)['"`]""",
+    r"""\b(\w+)\s*(?:<[^<>]*>)?\s*\(\s*['"`]((?:/|\$\{|https?:)[^'"`]*)['"`]""",
 )
 
 # The callee names that read as an HTTP wrapper rather than navigation/util.

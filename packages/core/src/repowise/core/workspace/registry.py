@@ -163,14 +163,19 @@ class RepoRegistry:
 
         from repowise.core.persistence.database import (
             create_engine,
-            get_db_url,
             init_db,
+            resolve_db_url,
         )
         from repowise.core.persistence.search import FullTextSearch
         from repowise.core.persistence.vector_store import InMemoryVectorStore
         from repowise.core.providers.embedding.base import MockEmbedder
 
-        db_url = get_db_url(f"sqlite:///{db_path.as_posix()}")
+        # resolve_db_url() checks REPOWISE_DB_URL/REPOWISE_DATABASE_URL before
+        # falling back to this repo's own sqlite file — the old hardcoded
+        # get_db_url(f"sqlite:///...") here always won, so workspace mode
+        # silently ignored any configured shared database (e.g. a Postgres
+        # sidecar) and kept writing per-repo SQLite regardless.
+        db_url = resolve_db_url(repo_path)
 
         engine = create_engine(db_url)
         await init_db(engine)

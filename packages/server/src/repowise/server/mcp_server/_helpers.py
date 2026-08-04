@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import os.path
@@ -56,6 +57,17 @@ _NL_QUESTION_TOKENS = frozenset(
 # ---------------------------------------------------------------------------
 
 
+
+# Set by _resolve_repo_context() whenever it resolves a workspace-mode
+# RepoContext, so _get_repo()'s no-arg fallback can scope to the repo the
+# current request actually belongs to. A plain module global would race
+# across concurrent workspace requests for different repos on the same
+# event loop; ContextVar isolates it per asyncio task.
+_current_repo_path: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_current_repo_path", default=None
+)
+
+
 async def _get_repo(session: AsyncSession, repo: str | None = None) -> Repository:
     """Resolve a repository — by path, by ID, or return the first one."""
     if repo:
@@ -74,6 +86,21 @@ async def _get_repo(session: AsyncSession, repo: str | None = None) -> Repositor
         if obj:
             return obj
         raise LookupError(f"Repository not found: {repo}")
+
+    # Workspace mode without an explicit repo: scope to whichever repo
+    # _resolve_repo_context() resolved for this request. Without this,
+    # a shared multi-repo database (e.g. REPOWISE_DB_URL pointing every
+    # workspace repo at the same Postgres instance) makes the plain
+    # limit(1) fallback below return an arbitrary repo's row regardless of
+    # which alias the caller actually meant (issue: cross-repo data bleed).
+    current_path = _current_repo_path.get()
+    if current_path is not None:
+        result = await session.execute(
+            select(Repository).where(Repository.local_path == current_path)
+        )
+        obj = result.scalar_one_or_none()
+        if obj:
+            return obj
 
     # Default: return the first (and often only) repository
     result = await session.execute(select(Repository).limit(1))
@@ -159,7 +186,7 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
             async with _get_session(_state._session_factory) as session:
                 await _get_repo(session, repo)  # raises LookupError if invalid
 
-        return RepoContext(
+        ctx = RepoContext(
             alias="default",
             path=Path(_state._repo_path) if _state._repo_path else Path.cwd(),
             session_factory=_state._session_factory,
@@ -169,6 +196,8 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
             vector_store_ready=_state._vector_store_ready or __import__("asyncio").Event(),
             _engine=None,
         )
+        _current_repo_path.set(str(ctx.path))
+        return ctx
 
     # Workspace mode — resolve via registry
     resolved = registry.resolve_repo_param(repo)
@@ -177,7 +206,9 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
             "repo='all' must be handled explicitly by each tool. "
             "Use _resolve_all_contexts() instead."
         )
-    return await registry.get(resolved)
+    ctx = await registry.get(resolved)
+    _current_repo_path.set(str(ctx.path))
+    return ctx
 
 
 async def _resolve_all_contexts() -> list[Any]:

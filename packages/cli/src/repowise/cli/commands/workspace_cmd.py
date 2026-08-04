@@ -1089,6 +1089,143 @@ def workspace_check(path: str | None, as_json: bool) -> None:
     sys.exit(1)
 
 
+@workspace_group.command("check-impact")
+@click.option(
+    "--repo",
+    "repo_alias",
+    required=True,
+    help="Alias of the repo being changed (must already be configured in the workspace).",
+)
+@click.option(
+    "--repo-path",
+    "repo_path_str",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help=(
+        "Filesystem path to re-extract --repo's contracts from — a git worktree checked "
+        "out to a PR branch, or any other checkout. Not read from the workspace's own "
+        "indexed copy of the repo."
+    ),
+)
+@click.argument("path", required=False, default=None)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit the raw breaking-change report as JSON."
+)
+def workspace_check_impact(
+    repo_alias: str, repo_path_str: str, path: str | None, as_json: bool
+) -> None:
+    """Check an unmerged repo checkout against the workspace's known contracts.
+
+    Re-extracts --repo's contracts from --repo-path — e.g. a git worktree checked
+    out to an open PR branch — merges them (in memory) with every other repo's
+    already-persisted contracts, and diffs the result against the persisted
+    contract store with the same breaking-change rules 'repowise update
+    --workspace' uses. This answers "does my unmerged branch break another
+    repo's consumer?" without a full workspace reindex.
+
+    Never writes to '.repowise-workspace/contracts.json' or 'system_graph.json' —
+    read-only. Exits non-zero when any breaking change is found, so it can gate
+    a PR.
+    """
+    import json as _json
+    import sys
+
+    from repowise.core.workspace.breaking_change import SEVERITY_BREAKING, detect_breaking_changes
+    from repowise.core.workspace.contracts import (
+        ContractStore,
+        _build_manual_links,
+        annotate_consumer_targets,
+        extract_repo_contracts,
+        load_contract_store,
+        match_contracts,
+    )
+
+    start = resolve_repo_path(path)
+    ws_root, ws_config = _require_workspace(start)
+
+    if not any(entry.alias == repo_alias for entry in ws_config.repos):
+        raise click.ClickException(
+            f"Unknown repo alias '{repo_alias}'. Run 'repowise workspace list' to see "
+            "configured aliases."
+        )
+
+    previous_store = load_contract_store(ws_root)
+    if previous_store is None:
+        raise click.ClickException(
+            "No contract store found. Run 'repowise update --workspace' to build "
+            "cross-repo contracts first."
+        )
+
+    repo_path = Path(repo_path_str).resolve()
+    contract_config = ws_config.contracts
+    fresh_contracts = run_async(extract_repo_contracts(repo_alias, repo_path, contract_config))
+
+    # Merged "current" store: persisted contracts for every repo except
+    # repo_alias, plus the freshly extracted ones for repo_alias. Re-annotate
+    # and re-match over the full set so cross-repo links involving repo_alias
+    # are resolved against its new contracts, not the stale persisted ones.
+    merged_contracts = [c for c in previous_store.contracts if c.repo != repo_alias]
+    merged_contracts.extend(fresh_contracts)
+    annotate_consumer_targets(merged_contracts, contract_config.service_bases)
+    merged_links = match_contracts(merged_contracts)
+    if contract_config.manual_links:
+        merged_links.extend(_build_manual_links(contract_config.manual_links))
+
+    current_store = ContractStore(
+        version=previous_store.version,
+        generated_at=previous_store.generated_at,
+        contracts=merged_contracts,
+        contract_links=merged_links,
+    )
+
+    report = detect_breaking_changes(previous_store, current_store)
+
+    if as_json:
+        console.print_json(_json.dumps(report.to_dict()))
+        if report.breaking_count:
+            sys.exit(1)
+        return
+
+    if not report.changes:
+        console.print(
+            f"\n[green]✓[/green] No incompatible contract changes in [bold]{repo_alias}[/bold] "
+            f"([dim]{repo_path}[/dim]) vs the workspace's known contracts."
+        )
+        return
+
+    console.print(
+        f"\n[bold]{repo_alias}[/bold] ([dim]{repo_path}[/dim]) — "
+        f"[red]{report.breaking_count} breaking[/red], "
+        f"[yellow]{report.warning_count} warning[/yellow] contract change(s):"
+    )
+    for change in report.changes:
+        color = "red" if change.severity == SEVERITY_BREAKING else "yellow"
+        console.print(
+            f"\n  [{color}]{change.kind}[/{color}] {change.contract_id} "
+            f"([dim]{change.contract_type}[/dim])"
+        )
+        console.print(f"    [dim]{change.provider_file}[/dim] — {change.detail}")
+        if change.impacted_consumers:
+            console.print(f"    impacts {len(change.impacted_consumers)} consumer(s):")
+            for ic in change.impacted_consumers:
+                console.print(
+                    f"      [red]{ic.repo}[/red] {ic.file} ({ic.symbol}) "
+                    f"[dim]{ic.match_type}, confidence={ic.confidence}[/dim]"
+                )
+        else:
+            console.print("    [dim]no known consumers[/dim]")
+
+    if report.breaking_count:
+        console.print(
+            f"\n[red]Impact check failed:[/red] {report.breaking_count} breaking change(s) "
+            f"impacting {report.total_impacted_consumers} consumer(s) across "
+            f"{len(report.impacted_repos)} repo(s)."
+        )
+        sys.exit(1)
+
+    console.print(f"\n[yellow]{report.warning_count} warning(s)[/yellow], no breaking changes.")
+
+
 # ---------------------------------------------------------------------------
 # workspace metrics
 # ---------------------------------------------------------------------------
