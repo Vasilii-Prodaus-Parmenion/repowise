@@ -1146,7 +1146,7 @@ class RefactoringSuggestion(Base):
     )
     refactoring_type: Mapped[str] = mapped_column(String(32), nullable=False)
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
-    target_symbol: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    target_symbol: Mapped[str] = mapped_column(Text, nullable=False, default="")
     line_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
     line_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
     plan_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
