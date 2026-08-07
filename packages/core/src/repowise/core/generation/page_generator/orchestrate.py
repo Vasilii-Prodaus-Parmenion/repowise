@@ -713,6 +713,14 @@ class _GenerationRun:
         # Level 4 (module_page).
         all_pages.extend(await self.run_level(_levels.build_level4_coros(self), 4))
 
+        # scc_page (level 3) and module_page (level 4) were the only readers
+        # of file_page_contexts. On a large repo this dict holds every code
+        # file's assembled context — including its trimmed source snippet —
+        # simultaneously, which dwarfs everything else in memory. Nothing
+        # downstream (levels 6-8, _finalize) reads it, so drop it here rather
+        # than carrying it for the rest of the run.
+        self.file_page_contexts.clear()
+
         # Level 5 was one page per KG layer. Those pages retired: the layer a
         # page belongs to is stamped on the page itself, so the docs tree can
         # group by it without a page to hang the group off.
