@@ -159,6 +159,17 @@ One-call RAG: retrieves over the wiki, gates synthesis on confidence, and return
 
 **Returns:** A synthesized answer with file/symbol citations and a confidence label (`high`, `medium`, `low`). High-confidence answers can be cited directly. Low-confidence answers return ranked wiki excerpts instead.
 
+Two path-bearing blocks, with different jobs:
+
+| Field | Job | Confidence-gated? |
+|-------|-----|-------------------|
+| `retrieval` | **Evidence.** Enriched hits (summary, snippet, key symbols) to re-read when the prose needs checking. Shrinks as confidence rises, because a trustworthy answer needs less of it. | Yes |
+| `candidates` | **Navigation.** The ranked shortlist of files retrieval resolved, one `{path, lines?}` entry each, up to 20. | No |
+
+`candidates` is present whenever retrieval resolved anything, including on high-confidence answers where `retrieval` is deliberately empty. It is where to look next; it is not evidence that the answer is right.
+
+**Retrieval legs:** three, fused by Reciprocal Rank Fusion: full-text and vector search over wiki pages, plus the structural symbol index. The symbol leg is keyed on the content words of the question rather than on whether it happens to carry an identifier-shaped token, so "how does an incremental update persist symbols" reaches the same rows as `_persist_symbols`. It exists because a generated file page renders only the *public* symbol table: a private helper or a local name is not in the text the other two legs index.
+
 **When to use:** First call on any code question. Collapses search, read, and reason into one round-trip. If confidence is low, follow up with `search_codebase` to discover candidate pages.
 
 **Example call:**
@@ -281,7 +292,22 @@ the **wiki**, instead of forcing a fallback to Grep for identifiers.
 
 - *Symbol hits*: `{type: "symbol", symbol_id, name, kind, file, start_line, end_line, signature, next: "get_symbol"}`. Ranked by exact-name/qualified-name match, query-token coverage, then graph centrality (PageRank / betweenness / entry-point); non-test before test unless `kind="test"`.
 - *File hits*: `{type: "file", page_id, file, title, next: "get_context"}`.
-- *Concept hits*: ranked wiki pages with `relevance_score`, `snippet`, `target_path`, and a `search_method` (`embedding` vs `bm25` fallback).
+- *Concept hits*: ranked wiki pages with `relevance_score`, `snippet`, `target_path`, and a `search_method` (`embedding` vs `bm25` fallback). A `symbol_spotlight` page's `target_path` is a page identifier of the form `file.py::Symbol`; those hits also carry `file` with the openable path. **Read `file` when present.** `target_path` is for piping into `get_symbol`, not for opening.
+
+Alongside `results`, the response carries **`candidates`**: up to `limit`
+distinct files worth opening next, one `{path}` entry each, best first.
+
+Every entry is a real file path, and that is the difference between the two
+blocks. `results` ranks *pages*, and a page is not always a file: a
+`module_page` is named by a structural group key that reads exactly like a
+directory, an `scc_page` by `scc-<hash>`, an `onboarding` page by a slot name.
+Ranking those is correct; opening them is not. `candidates` resolves symbol
+pages to their file, collapses several symbols of one file to a single entry,
+skips every page that names no file, and backfills from below the result
+window so a slot spent on a module page does not also cost you a file.
+
+**If your next move is a Read, read `candidates`.** If you are enumerating
+matches or resolving a `symbol_id`, read `results`.
 
 Tombstoned and `exclude_patterns`-excluded results are filtered. In workspace
 mode, structural and concept searches both federate across repos and merge

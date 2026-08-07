@@ -11,7 +11,6 @@ import json as _json
 import logging
 import sqlite3
 import subprocess
-import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -24,6 +23,9 @@ from typing import Any
 # a hand-synced copy). ``update_single_repo_index`` calls these directly,
 # bypassing the CLI lock acquisition in update_cmd, so workspace updates are
 # themselves single-flight per repo.
+from repowise.core.update_lock import (
+    lock_age_seconds as _lock_age_seconds,
+)
 from repowise.core.update_lock import (
     release_update_lock as _release_lock,
 )
@@ -75,6 +77,10 @@ class RepoUpdateResult:
     alias: str
     updated: bool  # True if an update was performed
     skipped_reason: str | None = None  # "up_to_date", "missing_directory", etc.
+    # How long the winning update had held the lock, when this repo deferred to
+    # one. Carried on the result because the caller reports the deferral and
+    # the age is the part that tells a slow update apart from a wedged one.
+    lock_age_seconds: float | None = None
     file_count: int = 0
     symbol_count: int = 0
     error: str | None = None
@@ -372,7 +378,7 @@ async def _incremental_repo_update(
     git_decay_map: dict[str, dict] = {}
     (
         parsed_files,
-        _source_map,
+        source_map,
         graph_builder,
         _structure,
         file_count,
@@ -390,7 +396,13 @@ async def _incremental_repo_update(
     )
 
     partial_health_report, dead_code_report = run_partial_analysis(
-        repo_path, graph_builder, git_meta_map, parsed_files, file_diffs, log=_log.info
+        repo_path,
+        graph_builder,
+        git_meta_map,
+        parsed_files,
+        file_diffs,
+        source_map=source_map,
+        log=_log.info,
     )
 
     # Partial health has consumed the per-file ``BlameIndex``; drop it before
@@ -690,15 +702,15 @@ async def update_workspace(
             # Check + acquire are one atomic exclusive create.
             existing = _try_acquire_lock(path, new_head)
             if existing is not None:
-                elapsed = int(time.time() - existing.get("started_at", time.time()))
+                age = _lock_age_seconds(existing)
                 target_short = (existing.get("target_commit") or "")[:8]
                 _log.info(
                     "workspace_update: skipping %s — update already in flight "
-                    "(pid=%s target=%s elapsed=%ds)",
+                    "(pid=%s target=%s elapsed=%ss)",
                     alias,
                     existing.get("pid"),
                     target_short,
-                    elapsed,
+                    int(age) if age is not None else "?",
                 )
                 # Record pending so the running update can roll forward.
                 with suppress(OSError):
@@ -707,6 +719,7 @@ async def update_workspace(
                     alias=alias,
                     updated=False,
                     skipped_reason="in_flight",
+                    lock_age_seconds=age,
                 )
 
             try:

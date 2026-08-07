@@ -482,13 +482,16 @@ async def _run_ingestion(
 
     if parse_cache is not None:
         parse_cache.save()
+    # Lend the just-read bytes to the builder so the language warmups that
+    # scan file text during build() don't re-read the repo.
+    graph_builder.set_source_map(source_map)
     _phase_done(progress, "parse")
 
     # ---- tsconfig path-alias resolver (before graph build) ------------------
     # Only runs when the repo has TS/JS files. On large TS monorepos the
     # resolver indexes hundreds of tsconfig files up-front; without a phase
     # label this shows up as a silent gap right after parsing.
-    _ts_langs = {"typescript", "javascript"}
+    _ts_langs = {"typescript", "javascript", "svelte", "vue"}
     if any(pf.file_info.language in _ts_langs for pf in parsed_files):
         if progress:
             progress.on_phase_start("tsconfig", None)

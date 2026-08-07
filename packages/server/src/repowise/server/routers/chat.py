@@ -404,7 +404,7 @@ async def chat_messages(repo_id: str, body: ChatRequest, request: Request):
 @router.get("/api/repos/{repo_id}/chat/conversations")
 async def list_conversations(
     repo_id: str,
-    session=Depends(get_db_session),  # noqa: B008
+    session=Depends(get_db_session),
 ):
     convs = await crud.list_conversations(session, repo_id)
     result = []
@@ -418,7 +418,7 @@ async def list_conversations(
 async def get_conversation(
     repo_id: str,
     conversation_id: str,
-    session=Depends(get_db_session),  # noqa: B008
+    session=Depends(get_db_session),
 ):
     conv = await crud.get_conversation(session, conversation_id)
     if not conv or conv.repository_id != repo_id:
@@ -435,7 +435,7 @@ async def get_conversation(
 async def delete_conversation(
     repo_id: str,
     conversation_id: str,
-    session=Depends(get_db_session),  # noqa: B008
+    session=Depends(get_db_session),
 ):
     conv = await crud.get_conversation(session, conversation_id)
     if not conv or conv.repository_id != repo_id:
@@ -553,7 +553,10 @@ def _build_tool_summary(tool_name: str, result: dict[str, Any]) -> str:
             author = (
                 origin.get("primary_author", "unknown") if origin.get("available") else "unknown"
             )
-            return f"{len(decisions)} decision(s), alignment: {score}, author: {author}"
+            # ``decisions`` is capped by the path-mode projection; report what
+            # governs the file, not how many survived the cap.
+            total = result.get("decisions_total", len(decisions))
+            return f"{total} decision(s), alignment: {score}, author: {author}"
         decisions = result.get("decisions", [])
         return f"Found {len(decisions)} decision(s)"
 

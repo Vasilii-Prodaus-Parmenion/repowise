@@ -17,10 +17,12 @@ from repowise.cli._repo_session import open_repo_db
 from repowise.cli.helpers import (
     config_fingerprint,
     get_head_commit,
+    load_config,
     load_state,
     run_async,
     save_config,
     save_state,
+    stamp_offered_slots,
 )
 from repowise.cli.state_persistence import build_kg_state, save_knowledge_graph_json
 from repowise.core.docs_mode import docs_mode_state_fields
@@ -81,11 +83,23 @@ async def _index_preserved_pages(sf: Any, fts: Any, preserved_page_ids: set[str]
             async with get_session(sf) as session:
                 rows = (
                     await session.execute(
-                        select(Page.id, Page.title, Page.content).where(Page.id.in_(batch))
+                        select(
+                            Page.id,
+                            Page.title,
+                            Page.content,
+                            Page.summary,
+                            Page.target_path,
+                        ).where(Page.id.in_(batch))
                     )
                 ).all()
-            for page_id, title, content in rows:
-                await fts.index(page_id, title or "", content or "")
+            for page_id, title, content, summary, target_path in rows:
+                await fts.index(
+                    page_id,
+                    title or "",
+                    content or "",
+                    summary=summary or "",
+                    target_path=target_path or "",
+                )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("persist.preserved_fts_backfill_failed", error=str(exc))
 
@@ -104,6 +118,7 @@ async def persist_result(result: Any, repo_path: Path) -> None:
         persist_generation,
         persist_pipeline_result,
         sweep_stale_generated_pages,
+        tombstone_absent_file_pages,
     )
 
     engine, sf, _repo_id = await open_repo_db(repo_path, repo_name=result.repo_name)
@@ -165,6 +180,20 @@ async def persist_result(result: Any, repo_path: Path) -> None:
         else:
             swept_page_ids = await persist_pipeline_result(result, session, repo.id)
 
+        # Tombstone pages whose file is simply gone. The other tombstone path
+        # reads a diff, and an init compares nothing, so until here a page
+        # written before its file was deleted stayed ``fresh`` through every
+        # later index. Outside the branch above because both branches need it.
+        # Its ids join the swept ones so they leave the vector store and the
+        # full-text index together, below, after this session closes.
+        try:
+            swept_page_ids = [
+                *swept_page_ids,
+                *await tombstone_absent_file_pages(session, repo.id, repo_path),
+            ]
+        except Exception as exc:  # one stale page must not fail a whole index
+            logger.warning("tombstone_absent_sweep_failed", error=str(exc))
+
         # Record a completed GenerationJob so the web UI can show
         # "last synced" / "last re-indexed" timestamps.
         now = datetime.now(UTC)
@@ -207,7 +236,13 @@ async def persist_result(result: Any, repo_path: Path) -> None:
         await fts.delete_many(swept_page_ids)
     if fts is not None and result.generated_pages:
         for page in result.generated_pages:
-            await fts.index(page.page_id, page.title, page.content)
+            await fts.index(
+                page.page_id,
+                page.title,
+                page.content,
+                summary=page.summary,
+                target_path=page.target_path,
+            )
     await _index_preserved_pages(sf, fts, getattr(result, "preserved_page_ids", None))
 
     # Stamp the analysis (+ generation) phases in the resume ledger now that
@@ -326,6 +361,14 @@ def save_full_state_and_config(
     # A full init/index genuinely brings the store to the current store format
     # (its pages are the concept tree), so stamp the terminal version rather
     # than clamping at the reindex gate a routine persist would stop below.
+    #
+    # The same run offered every registered onboarding slot its signals, so
+    # record which ones. A slot absent from a fresh index was refused by its
+    # gate, not missed, and the missing-slot notice must not report it.
+    # Read back rather than passed in: init writes ``enable_onboarding: false``
+    # to config.yaml before it reaches here, and only when it is false, so the
+    # file is the run's own answer by the time this runs.
+    stamp_offered_slots(state, enabled=bool(load_config(repo_path).get("enable_onboarding", True)))
     save_state(repo_path, state, full_index=True)
 
     if kg is not None:

@@ -7,10 +7,16 @@ parameter greedily matches the suffix as part of the page_id.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.generation.page_redirects import (
+    SupersededError,
+    repo_wide_successor_type,
+    resolve_superseded,
+)
 from repowise.core.persistence import crud
 from repowise.core.persistence.models import _now_utc
 from repowise.server.deps import get_db_session, verify_api_key
@@ -20,11 +26,97 @@ from repowise.server.schemas import (
     PageVersionResponse,
 )
 
+logger = structlog.get_logger(__name__)
+
 router = APIRouter(
     prefix="/api/pages",
     tags=["pages"],
     dependencies=[Depends(verify_api_key)],
 )
+
+# Names the id the reader actually asked for when they were moved. Without it a
+# redirect is indistinguishable from having requested the successor directly,
+# and a client cannot tell the reader their link is out of date.
+REDIRECTED_FROM_HEADER = "X-Repowise-Redirected-From"
+
+
+async def _sole_page_of_type(session: AsyncSession, page_type: str, retired_id: str):
+    """The store's single page of *page_type*, or ``None``.
+
+    Some retirements hand off to "the repository's overview" rather than to a
+    named id, because the retired id carries nothing that identifies the
+    successor. The store is what knows, so it is asked here.
+
+    Requires exactly one match. Zero means the index never produced the
+    successor; more than one means the store holds several repositories and
+    picking either would send readers of one repository into another's wiki.
+    Both are refusals rather than guesses, and both are logged, because either
+    strands every inbound link to the retired page.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Page
+
+    rows = (await session.execute(select(Page).where(Page.page_type == page_type))).scalars().all()
+    if len(rows) == 1:
+        return rows[0]
+    logger.warning(
+        "page_redirect_repo_wide_unresolved",
+        page_id=retired_id,
+        successor_type=page_type,
+        matches=len(rows),
+    )
+    return None
+
+
+async def _get_page_or_successor(session: AsyncSession, page_id: str, response: Response):
+    """The requested page, or the page that took over from it.
+
+    Wiki pages are public and linkable, so an id that stops being generated has
+    to keep resolving. A miss is retried against the retirement table before it
+    becomes a 404.
+
+    Returns ``None`` when neither the page nor a successor exists — callers
+    raise the 404, so a genuine miss can never be turned into a success here.
+    """
+    page = await crud.get_page(session, page_id)
+    if page is not None:
+        return page
+
+    try:
+        successor_id = resolve_superseded(page_id)
+        repo_wide_type = None if successor_id else repo_wide_successor_type(page_id)
+    except SupersededError:
+        # The table is static and a test resolves every entry in it, so this
+        # means a real bug. It must not take page serving down with it.
+        logger.warning("page_redirect_table_broken", page_id=page_id, exc_info=True)
+        return None
+
+    if repo_wide_type is not None:
+        successor = await _sole_page_of_type(session, repo_wide_type, page_id)
+        if successor is None:
+            return None
+        logger.info("page_redirect_served", page_id=page_id, successor_id=successor.id)
+        response.headers[REDIRECTED_FROM_HEADER] = page_id
+        return successor
+
+    if successor_id is None:
+        return None
+
+    successor = await crud.get_page(session, successor_id)
+    if successor is None:
+        # The table points at a page this index did not produce. Every inbound
+        # link to the retired id is stranded, so say so rather than 404ing mute.
+        logger.warning(
+            "page_redirect_successor_missing",
+            page_id=page_id,
+            successor_id=successor_id,
+        )
+        return None
+
+    logger.info("page_redirect_served", page_id=page_id, successor_id=successor_id)
+    response.headers[REDIRECTED_FROM_HEADER] = page_id
+    return successor
 
 
 @router.get("", response_model=None)
@@ -50,7 +142,7 @@ async def list_pages(
         "of a listing's bytes, and read by nothing that renders a list of "
         "pages — and adds 'content_chars' in their place.",
     ),
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    session: AsyncSession = Depends(get_db_session),
 ) -> list[PageResponse] | list[PageSummaryResponse]:
     """List wiki pages for a repository."""
     if fields not in ("full", "summary"):
@@ -77,6 +169,7 @@ async def list_pages(
 
 @router.get("/lookup", response_model=PageResponse)
 async def get_page_by_query(
+    response: Response,
     page_id: str = Query(..., description="Page ID (e.g. file_page:src/main.py)"),
     repo_id: str | None = Query(
         None,
@@ -84,7 +177,7 @@ async def get_page_by_query(
         "reach a page outside the default store in workspace mode, where the "
         "session is routed by this value.",
     ),
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    session: AsyncSession = Depends(get_db_session),
 ) -> PageResponse:
     """Get a single wiki page by ID passed as query parameter.
 
@@ -95,8 +188,11 @@ async def get_page_by_query(
     workspace server looks the page up in whichever store is the default, and a
     page id that exists in another repo comes back as a 404 — so any caller
     that knows the repo should say so.
+
+    A retired page id resolves to whatever took over from it; the response then
+    carries ``X-Repowise-Redirected-From``.
     """
-    page = await crud.get_page(session, page_id)
+    page = await _get_page_or_successor(session, page_id, response)
     if page is None:
         raise HTTPException(status_code=404, detail="Page not found")
     return PageResponse.from_orm(page)
@@ -106,7 +202,7 @@ async def get_page_by_query(
 async def get_page_versions_by_query(
     page_id: str = Query(..., description="Page ID"),
     limit: int = Query(50, ge=1, le=200),
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    session: AsyncSession = Depends(get_db_session),
 ) -> list[PageVersionResponse]:
     """Get version history for a wiki page (page_id as query param)."""
     versions = await crud.get_page_versions(session, page_id, limit=limit)
@@ -123,7 +219,7 @@ class PageNotesUpdate(BaseModel):
 async def update_page_notes(
     body: PageNotesUpdate,
     page_id: str = Query(..., description="Page ID"),
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    session: AsyncSession = Depends(get_db_session),
 ) -> PageResponse:
     """Set or clear the human-curated note pinned above a page's generated
     content. Notes survive regeneration, so this never touches versions."""
@@ -149,7 +245,7 @@ async def regenerate_page_by_query(
         "none",
         description="What to do with the pages that summarize this one: none / dependents / full.",
     ),
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Force-regenerate a single wiki page (page_id as query param).
 
@@ -205,13 +301,17 @@ async def regenerate_page_by_query(
 @router.get("/{page_id:path}", response_model=PageResponse)
 async def get_page(
     page_id: str,
-    session: AsyncSession = Depends(get_db_session),  # noqa: B008
+    response: Response,
+    session: AsyncSession = Depends(get_db_session),
 ) -> PageResponse:
     """Get a single wiki page by ID in path (e.g. ``file_page:src/main.py``).
 
     The page_id is URL-decoded automatically by FastAPI.
+
+    A retired page id resolves to whatever took over from it; the response then
+    carries ``X-Repowise-Redirected-From``.
     """
-    page = await crud.get_page(session, page_id)
+    page = await _get_page_or_successor(session, page_id, response)
     if page is None:
         raise HTTPException(status_code=404, detail="Page not found")
     return PageResponse.from_orm(page)

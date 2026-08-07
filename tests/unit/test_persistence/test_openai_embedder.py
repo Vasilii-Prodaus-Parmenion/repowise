@@ -46,6 +46,42 @@ def test_dimensions_unknown_model_defaults_to_1536():
     assert emb.dimensions == 1536
 
 
+def test_dimensions_explicit_override_wins_for_unknown_model():
+    emb = OpenAIEmbedder(api_key="k", model="local-embedder", dimensions=2560)
+    assert emb.dimensions == 2560
+
+
+def test_dimensions_from_env(monkeypatch):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_DIMS", "2560")
+    emb = OpenAIEmbedder(api_key="k", model="local-embedder")
+    assert emb.dimensions == 2560
+
+
+def test_explicit_dimensions_beats_env(monkeypatch):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_DIMS", "2560")
+    emb = OpenAIEmbedder(api_key="k", model="local-embedder", dimensions=1024)
+    assert emb.dimensions == 1024
+
+
+def test_env_overrides_known_model_width(monkeypatch):
+    # Precedence holds for a stock model too: the env wins over the table.
+    monkeypatch.setenv("REPOWISE_EMBEDDING_DIMS", "512")
+    emb = OpenAIEmbedder(api_key="k", model="text-embedding-3-small")
+    assert emb.dimensions == 512
+
+
+@pytest.mark.parametrize("bad", [0, -5, True])
+def test_invalid_dimensions_raises(bad):
+    with pytest.raises(ValueError, match="dimensions must be a positive integer"):
+        OpenAIEmbedder(api_key="k", model="local-embedder", dimensions=bad)
+
+
+def test_malformed_env_raises_the_same_message(monkeypatch):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_DIMS", "abc")
+    with pytest.raises(ValueError, match="dimensions must be a positive integer"):
+        OpenAIEmbedder(api_key="k", model="local-embedder")
+
+
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
@@ -108,3 +144,44 @@ async def test_embed_passes_model_and_input():
 
     assert captured[0]["model"] == "text-embedding-3-large"
     assert captured[0]["input"] == ["test text"]
+
+
+# ---------------------------------------------------------------------------
+# Forwarding the width to the API
+# ---------------------------------------------------------------------------
+
+
+async def _capture_create_kwargs(emb: OpenAIEmbedder) -> dict:
+    captured: dict = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _make_mock_response([[1.0, 0.0]])
+
+    with patch("openai.OpenAI") as mock_client:
+        mock_client.return_value.embeddings.create.side_effect = fake_create
+        await emb.embed(["text"])
+    return captured
+
+
+# The behaviour is model-agnostic: an override is declared *and* requested from
+# the API for any model; the model names below are only illustrative inputs.
+@pytest.mark.parametrize(
+    "model",
+    ["text-embedding-3-small", "text-embedding-ada-002", "local-embedder"],
+)
+async def test_overridden_width_is_declared_and_sent(monkeypatch, model):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_DIMS", "512")
+    emb = OpenAIEmbedder(api_key="k", model=model)
+    assert emb.dimensions == 512
+    kwargs = await _capture_create_kwargs(emb)
+    assert kwargs["dimensions"] == 512
+
+
+async def test_default_request_omits_dimensions():
+    # No override → the request stays byte-identical: no dimensions key, so a
+    # server that would reject the parameter is never sent it.
+    kwargs = await _capture_create_kwargs(
+        OpenAIEmbedder(api_key="k", model="text-embedding-3-small")
+    )
+    assert "dimensions" not in kwargs

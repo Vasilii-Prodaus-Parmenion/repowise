@@ -25,6 +25,9 @@ crashes or blocks your agent.
 | **Command-rewrite (distill)** | Claude Code | `repowise hook rewrite install` (opt-in) | `Bash` / `PowerShell` | Rewrites noisy commands to `repowise distill <cmd>`; auto-allowed by default, set `permission: ask` to approve each one |
 | **Codex context + staleness** | Codex | `repowise init --codex` | SessionStart / UserPromptSubmit / edit / Bash | Reminds Codex to use the MCP tools and flags stale context after edits |
 
+Every agent hook records what it said and whether the agent acted on it — see
+[`repowise hook stats`](#is-any-of-this-actually-helping--repowise-hook-stats).
+
 ---
 
 ## Git hook: post-commit auto-sync
@@ -119,15 +122,53 @@ what it depends on, and that it is a hotspot, without a separate MCP call:
     Git: HOTSPOT, bus-factor=1, owner=RaghavChamadiya
 ```
 
+**Search-flood digests.** A grep that returns 50+ matches also gets a compact
+per-file digest: every matched file with its match count and two anchor line
+numbers, ranked by graph centrality when the index can rank them, and an explicit
+`(N more files, M matches)` tail for anything past the top ten.
+
+With `hooks.search_digest: true` in `.repowise/config.yaml`, written by the same
+yes/no as the rewrite hook, and toggled afterwards with `repowise hook
+search-digest install | uninstall | status`, that digest *replaces* the raw
+match list rather than riding alongside it. Re-run the search scoped to a file it
+names, or read those lines directly, to see any match in full. Savings appear in
+`repowise saved` under the `search_digest` filter, and a repo with it off still
+gets the counterfactual number.
+
+Two cases are deliberately left alone. A **single-file context grep** (`-C`,
+`-A`, `-B`) is never digested: that context is exactly what the agent asked for,
+and Claude Code renders those results without a path prefix, so they are not
+parsed as a multi-file flood in the first place. And `files_with_matches` results
+carry no match text to replace: the file list is already a digest.
+
 **Git/edit freshness.** After a successful `git commit`, `merge`, `rebase`,
 `cherry-pick`, or `pull`, repowise compares `HEAD` against the last indexed commit
 in `.repowise/state.json` and, if the wiki is behind, reminds the agent to run
 `repowise update` so it never silently works from outdated docs.
 
-**Read-intelligence.** On `Read` of an indexed file, repowise can nudge the agent
-toward the cheaper `get_context(..., include=["skeleton"])` for structure-level
-questions, and emit a per-file stale-read notice when the file changed after
-indexing.
+**Read-intelligence.** On `Read` of an indexed file, repowise emits a per-file
+stale-read notice when the file changed after the session's previous read of it,
+and points at the cheaper `get_context(..., include=["skeleton"])` for
+structure-level questions.
+
+With `hooks.read_skeleton: true` in `.repowise/config.yaml` — which `repowise
+init` writes from the same yes/no as the rewrite hook, and which `repowise hook
+read-skeleton install | uninstall | status` toggles afterwards — that pointer
+becomes an action: an
+unbounded `Read` of a large indexed file returns the file's *skeleton* instead of
+the file, once per file per session. Signatures stay, keeping their real line
+numbers; bodies collapse to `... N lines (a-b)` markers carrying 1-indexed ranges,
+so the agent can range-read any elided span back — the same reversibility contract
+`repowise distill` makes for shell output. Reading the file again with no range
+returns it whole. Savings appear in `repowise saved` under the `read_skeleton`
+filter. In a repo that has it off, the same Reads are still *measured*, and
+`repowise saved` reports what they would have saved — a number about size only,
+never about whether the agent could work from a skeleton.
+
+One consequence is worth knowing: a Read the agent saw only as a skeleton still
+satisfies Claude Code's read-before-edit precondition, so an `Edit` (especially
+with `replace_all`) or a `Write` could touch bodies it never saw. Editing such a
+file raises a one-line warning, once per file, until the file is read in full.
 
 **Edit-time "governed by" decisions.** When the agent edits a file governed by an
 architectural decision (via `decision_node_links`), it gets a one-line notice
@@ -189,6 +230,32 @@ not touch your global `~/.codex/config.toml`):
   update`.
 
 Full Codex setup: [CODEX.md](CODEX.md).
+
+---
+
+## Hook efficacy: `repowise hook stats`
+
+The agent hooks keep a local ledger in `.repowise/sessions/sessions.db`: what
+each hook said, and whether the agent went on to do what it pointed at.
+
+```sh
+repowise hook stats                        # per-surface firing counts and action rates
+repowise hook backfill --all-projects      # seed it from your existing transcripts
+```
+
+The verdict comes from your own Claude Code transcripts — a firing is paired
+with the tool calls that followed it — so the numbers are yours, not a
+benchmark. `repowise update` classifies recent sessions; `hook backfill` covers
+history. Nothing leaves the machine.
+
+Notices that ask for nothing (the stale-read warning, the silent
+read-after-served measurement) report `n/a` rather than a rate. `hook stats`
+also reports hook invocation counts and wall time, including the calls that
+returned silence.
+
+> Upgrading from a release before firings were keyed by their text: run
+> `repowise hook backfill --reset` once, or older rows are counted separately
+> from the replayed ones. It never touches decisions.
 
 ---
 

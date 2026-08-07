@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -19,6 +21,14 @@ from repowise.core.generation.models import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# A second, stdlib logger for the one message here that has to survive
+# ``repowise init``. ``configure_cli_logging`` pins both ``repowise.core`` and
+# structlog to ERROR for the progress-bar commands, so anything below ERROR is
+# discarded in the exact command that writes the index. The refusal below is
+# logged through this at ERROR for that reason; the routine counts stay on
+# structlog with their siblings.
+_log = logging.getLogger(__name__)
 
 # Max page ids per UPDATE ... IN (...) so a large cascade cannot exceed
 # SQLite's bound-variable limit on the local CLI store.
@@ -43,7 +53,7 @@ def tombstone_candidates(file_diffs: list[Any]) -> list[tuple[str, list[str]]]:
 
 async def mark_tombstone_pages(
     session: Any, repo_id: str, candidates: list[tuple[str, list[str]]]
-) -> int:
+) -> list[str]:
     """Mark file pages for deleted/renamed files as tombstones.
 
     A ``freshness_status="fresh"`` page for a file that no longer exists is
@@ -52,10 +62,16 @@ async def mark_tombstone_pages(
     (the prose may still orient a reader) but carry status=tombstone and
     ``successor_paths`` in metadata so serving layers can skip or redirect.
 
-    Returns the number of pages marked.
+    Returns the page ids marked, so the caller can drop them from the
+    full-text index once its session has closed. Every serving layer already
+    discards a tombstone, but retrieval fetches a fixed number of rows before
+    any of that runs, so a tombstone still takes one of those slots and pushes
+    a real candidate out of the fetch. The row has to go, and only the caller
+    knows when it is safe to write to the index — on SQLite it shares a file
+    with this session.
     """
     if not candidates:
-        return 0
+        return []
     from sqlalchemy import select
 
     from repowise.core.persistence.models import Page
@@ -64,7 +80,7 @@ async def mark_tombstone_pages(
     res = await session.execute(
         select(Page).where(Page.repository_id == repo_id, Page.id.in_(page_ids))
     )
-    marked = 0
+    marked: list[str] = []
     for page in res.scalars().all():
         _, successors = page_ids[page.id]
         page.freshness_status = "tombstone"
@@ -74,9 +90,9 @@ async def mark_tombstone_pages(
             meta = {}
         meta["successor_paths"] = successors
         page.metadata_json = json.dumps(meta)
-        marked += 1
+        marked.append(page.id)
     if marked:
-        logger.info("pages_tombstoned", repo_id=repo_id, count=marked)
+        logger.info("pages_tombstoned", repo_id=repo_id, count=len(marked))
     elif candidates:
         # Candidates existed but no page matched — the id scheme drifted from
         # ``file_page:{path}`` or the paths don't line up. Silent success here
@@ -87,6 +103,89 @@ async def mark_tombstone_pages(
             candidate_count=len(candidates),
             sample=[p for p, _ in candidates[:3]],
         )
+    return marked
+
+
+async def tombstone_absent_file_pages(
+    session: Any, repo_id: str, repo_path: Path | str
+) -> list[str]:
+    """Tombstone every file page whose file is no longer on disk.
+
+    :func:`mark_tombstone_pages` works from a diff, so it only ever sees a
+    file that was deleted or renamed *between two commits this run compared*.
+    ``repowise init`` compares nothing — it indexes a checkout as it stands —
+    so it has never tombstoned anything, and a page written before a file was
+    deleted keeps ``freshness_status='fresh'`` through every later index.
+
+    That page is the trap the tombstone exists to close: retrieval serves it,
+    agents cite it, and the index-age metadata says nothing is wrong.
+
+    The check is a plain existence test against the checkout rather than a
+    comparison with what this run parsed. A file can be present but unparsed —
+    an unsupported extension, a parse failure, a changed exclude list — and
+    such a file is stale, not deleted. Calling it deleted would put a
+    ``successor_paths: []`` on a page whose file a reader can still open.
+
+    Returns the page ids marked, so the caller can drop them from the
+    full-text index once its session has closed, on the same terms as
+    :func:`mark_tombstone_pages`.
+    """
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import Page
+
+    root = Path(repo_path)
+    res = await session.execute(
+        select(Page).where(
+            Page.repository_id == repo_id,
+            Page.page_type == "file_page",
+            Page.freshness_status != "tombstone",
+        )
+    )
+    live = list(res.scalars().all())
+    if not live:
+        return []
+
+    absent = [p for p in live if not (root / (p.target_path or "")).exists()]
+    if not absent:
+        return []
+
+    # Every page absent means the paths are not being resolved against the
+    # tree they were written from — a wrong root, a bare-repo checkout, a
+    # working copy that has not been restored yet. Tombstoning the whole wiki
+    # on that reading is worse than leaving it, and unlike a partial mistake
+    # it is not recoverable by re-indexing a file. Refuse, loudly, and let the
+    # rest of the run proceed.
+    if len(absent) == len(live):
+        _log.error(
+            "tombstone_sweep_refused repo_id=%s file_pages=%d root=%s: every file "
+            "page's path is missing from the checkout, which reads as a wrong "
+            "root rather than a deleted repository. Nothing was tombstoned.",
+            repo_id,
+            len(live),
+            root,
+        )
+        return []
+
+    marked: list[str] = []
+    for page in absent:
+        page.freshness_status = "tombstone"
+        try:
+            meta = json.loads(page.metadata_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+        # Deleted, not renamed: rename detection is the diff-driven sweep's
+        # job and it has evidence this one does not.
+        meta["successor_paths"] = []
+        page.metadata_json = json.dumps(meta)
+        marked.append(page.id)
+
+    logger.info(
+        "file_pages_tombstoned_absent",
+        repo_id=repo_id,
+        count=len(marked),
+        sample=[p.target_path for p in absent[:3]],
+    )
     return marked
 
 
@@ -540,6 +639,91 @@ async def _prune_stale_file_rows(
 _SWEPT_GENERATED_PAGE_TYPES = STRUCTURALLY_KEYED_PAGE_TYPES
 
 
+async def sweep_retired_pages(session: Any, repo_id: str) -> list[str]:
+    """Delete every row of a page that no longer exists, by type or by id.
+
+    Distinct from the two sweeps below, and simpler than either: those ask what
+    *this* run produced, because a page of a live type may legitimately be
+    absent from a scoped run. A retired page has no legitimate rows at all —
+    nothing emits one and no failure mode can make anything emit one — so the
+    question never arises and this is safe on every path, full or scoped.
+
+    The retirement tables are the source of truth rather than a list repeated
+    here. A page is retired exactly when a reader following its id gets sent
+    somewhere else, and that is what those tables say; keeping a second list
+    would let a page be redirected without being swept, which is the state this
+    function was written to clear.
+
+    That state is the reason this exists. The architecture diagram merged into
+    the overview and layer pages became grouping rows in the tree, both with
+    redirects registered — but ``architecture_diagram`` is not structurally
+    keyed, so no sweep ever covered it, and ``layer_page`` was only swept by a
+    full run. An index that has only been updated incrementally since therefore
+    still serves both. On this repository the retired diagram was the
+    second-ranked retrieval hit for "how does the ingestion pipeline work",
+    competing with the overview it had been merged into.
+
+    Retirement by *id* is the second half of the same argument, and the reason
+    this is no longer named for types. Three orientation slots retired out of
+    the onboarding collection while five stayed, so their rows cannot be
+    reached by page type: ``onboarding`` still has legitimate rows and always
+    will. Sweeping the exact ids is the only way those leave a store, and the
+    safety argument is unchanged — a retired id names a page nothing emits.
+
+    Returns the swept page ids so the caller can drop them from the vector
+    store and from FTS. A row deleted here but left in either of those is worse
+    than one never swept: search still answers from the FTS copy, with the full
+    title and snippet of a page the reader can no longer open.
+    """
+    from sqlalchemy import delete, or_, select
+
+    from repowise.core.generation.page_redirects import (
+        RETIRED_IDS,
+        SUPERSEDED_TO_REPO_WIDE,
+        SUPERSEDED_TYPES,
+    )
+    from repowise.core.persistence.models import Page, PageVersion
+
+    retired_types = sorted(set(SUPERSEDED_TYPES) | set(SUPERSEDED_TO_REPO_WIDE))
+    retired_ids = sorted(RETIRED_IDS)
+    if not retired_types and not retired_ids:
+        return []
+
+    # Either rule can match, and a page matched by both is one row either way.
+    match_clauses = []
+    if retired_types:
+        match_clauses.append(Page.page_type.in_(retired_types))
+    if retired_ids:
+        match_clauses.append(Page.id.in_(retired_ids))
+
+    stale = (
+        (
+            await session.execute(
+                select(Page.id).where(
+                    Page.repository_id == repo_id, or_(*match_clauses)
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for i in range(0, len(stale), _PRUNE_CHUNK):
+        batch = stale[i : i + _PRUNE_CHUNK]
+        await session.execute(delete(PageVersion).where(PageVersion.page_id.in_(batch)))
+        await session.execute(
+            delete(Page).where(Page.repository_id == repo_id, Page.id.in_(batch))
+        )
+    if stale:
+        logger.info(
+            "retired_pages_swept",
+            repo_id=repo_id,
+            count=len(stale),
+            types=retired_types,
+            ids=retired_ids,
+        )
+    return list(stale)
+
+
 async def _sweep_stale_generated_pages(
     session: Any,
     repo_id: str,
@@ -672,9 +856,7 @@ async def sweep_superseded_generated_pages(
         produced_ids.setdefault(page_type, set()).add(page.page_id)
         metadata = getattr(page, "metadata", None) or {}
         members = metadata.get("file_paths") or metadata.get("files") or []
-        covered.setdefault(page_type, set()).update(
-            m for m in members if isinstance(m, str)
-        )
+        covered.setdefault(page_type, set()).update(m for m in members if isinstance(m, str))
 
     swept: list[str] = []
     for page_type, current in produced_ids.items():
@@ -716,9 +898,7 @@ async def sweep_superseded_generated_pages(
         swept.extend(stale)
 
     if swept:
-        logger.info(
-            "superseded_generated_pages_swept", repo_id=repo_id, count=len(swept)
-        )
+        logger.info("superseded_generated_pages_swept", repo_id=repo_id, count=len(swept))
     return swept
 
 
@@ -982,15 +1162,47 @@ async def persist_analysis(result: Any, session: Any, repo_id: str) -> None:
             if harvested:
                 decision_dicts.extend(harvested)
 
-    # One-shot drain of proposals from the removed code_comment harvest;
-    # without this, DBs indexed before its removal keep a flooded review
-    # queue forever (#751). Confirmed/dismissed rows are kept.
+    # Restore records the semantic supersession detector retired before it was
+    # turned off. ``superseded`` is a protected status, so nothing else will
+    # ever walk these back, and a store that only stops retiring is still a
+    # store with a quarter of its corpus hidden. Runs whether or not this run
+    # produced decisions.
+    #
+    # BEFORE the purge below, not after: restoring puts a row back at
+    # ``proposed``, which is exactly what the purge deletes. Un-retire first and
+    # a run ends in one consistent state — good records visible, retired-source
+    # records gone. The other order leaves a restored changelog row alive for
+    # one run and silently deletes it on the next.
     try:
+        from repowise.core.persistence.crud import unretire_auto_superseded
+
+        await unretire_auto_superseded(session)
+    except Exception as _unretire_err:
+        logger.debug("decision_unretire_skipped", error=str(_unretire_err))
+
+    # One-shot drain of proposals left by retired extraction sources; without
+    # this, DBs indexed before a removal keep a flooded review queue forever
+    # (#751 for code_comment). Confirmed/dismissed rows are kept.
+    try:
+        from repowise.core.analysis.decision_provenance import RETIRED_SOURCES
         from repowise.core.persistence.crud import purge_proposed_decisions_by_source
 
-        await purge_proposed_decisions_by_source(session, repo_id, "code_comment")
+        for _retired in RETIRED_SOURCES:
+            await purge_proposed_decisions_by_source(session, repo_id, _retired)
     except Exception as _purge_err:
         logger.debug("decision_purge_skipped", error=str(_purge_err))
+
+    # Re-stamp evidence rows left on a previous SOURCE_RANK ladder. Local stores
+    # are created by ``init_db`` and never see Alembic, so the migration alone
+    # would only reach hosted; this is the same repair on the path every store
+    # takes. No-op scan once reconciled, and it runs whether or not this run
+    # produced decisions, because a store with nothing new still holds the rows.
+    try:
+        from repowise.core.persistence.crud import reconcile_source_ranks
+
+        await reconcile_source_ranks(session)
+    except Exception as _rank_err:
+        logger.debug("decision_rank_reconcile_skipped", error=str(_rank_err))
 
     if decision_dicts:
         # Reuse the run's shared vector store for semantic (paraphrase) dedup
@@ -1194,6 +1406,9 @@ async def persist_pipeline_result(
         getattr(result, "authoritative_page_types", None),
         getattr(result, "preserved_page_ids", None),
     )
+    # Rows of a page type that no longer exists at all. Independent of what
+    # this run produced, so it runs on every path rather than only here.
+    swept_page_ids += await sweep_retired_pages(session, repo_id)
 
     # Placement depends on the whole page set, so it is computed here rather
     # than during generation, after the sweep has retired anything stale.

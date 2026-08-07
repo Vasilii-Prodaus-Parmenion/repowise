@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from dataclasses import dataclass
@@ -194,6 +195,42 @@ def load_state(repo_path: Path) -> dict[str, Any]:
     return {}
 
 
+#: Slots the last whole-repo generation put in front of this repository's
+#: signals, which is not the same as the slots that produced a page. The two
+#: differ, and only the first answers "has this index ever been offered a
+#: Glossary?".
+ONBOARDING_SLOTS_OFFERED_KEY = "onboarding_slots_offered"
+
+
+def stamp_offered_slots(state: dict[str, Any], *, enabled: bool = True) -> None:
+    """Record which onboarding slots this whole-repo run evaluated.
+
+    Only a run that generates the whole repository may call this: the slot
+    gates read whole-repo signals, so a scoped run that saw one changed file
+    has not offered anything to anything.
+
+    Written because a missing onboarding row has two causes that look identical
+    in a store and want opposite responses. A slot registered after this index
+    was built has never been evaluated here, and ``update --full`` would build
+    it; a slot that *was* evaluated and whose gate refused the repository will
+    be refused again by the same signals, and telling the user to spend a model
+    run on it is a lie. Measured on ``test-repos/microdot``: of the five
+    registered slots, two produce pages and three (``getting_started``,
+    ``active_landscape``, ``glossary``) are gate-skipped on every run, full or
+    fresh. A notice driven by the rows alone would name all three, forever, and
+    none of them would ever arrive.
+
+    ``enabled`` is the run's ``enable_onboarding``. A run with onboarding off
+    offered nothing, and recording otherwise would silence the notice for a
+    user who later turns it on.
+    """
+    from repowise.core.generation.onboarding import iter_specs
+
+    state[ONBOARDING_SLOTS_OFFERED_KEY] = (
+        sorted(spec.slot for spec in iter_specs()) if enabled else []
+    )
+
+
 def save_state(repo_path: Path, state: dict[str, Any], *, full_index: bool = False) -> None:
     """Write *state* to ``.repowise/state.json``.
 
@@ -278,10 +315,8 @@ def write_update_queued(repo_path: Path, head: str | None) -> None:
     except OSError:
         return
     payload = {"target_commit": head, "queued_at": time.time()}
-    try:
+    with contextlib.suppress(OSError):
         _update_queued_path(repo_path).write_text(json.dumps(payload), encoding="utf-8")
-    except OSError:
-        pass
 
 
 def read_update_queued(repo_path: Path) -> dict[str, Any] | None:
@@ -305,10 +340,8 @@ def read_update_queued(repo_path: Path) -> dict[str, Any] | None:
 
 def clear_update_queued(repo_path: Path) -> None:
     """Drop the queued marker. Called by update_cmd once it owns the real lock."""
-    try:
+    with contextlib.suppress(OSError):
         _update_queued_path(repo_path).unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def write_update_pending(repo_path: Path, head: str | None) -> None:
@@ -324,10 +357,8 @@ def write_update_pending(repo_path: Path, head: str | None) -> None:
         ensure_repowise_dir(repo_path)
     except OSError:
         return
-    try:
+    with contextlib.suppress(OSError):
         _update_pending_path(repo_path).write_text(head, encoding="utf-8")
-    except OSError:
-        pass
 
 
 def read_update_pending(repo_path: Path) -> str | None:
@@ -344,10 +375,8 @@ def read_update_pending(repo_path: Path) -> str | None:
 
 def clear_update_pending(repo_path: Path) -> None:
     """Drop the pending marker once the rolled-forward update has consumed it."""
-    try:
+    with contextlib.suppress(OSError):
         _update_pending_path(repo_path).unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _pending_commit_still_ahead(
@@ -607,6 +636,28 @@ def save_distill_commands_enabled(repo_path: Path, *, enabled: bool) -> None:
     commands["enabled"] = enabled
     distill["commands"] = commands
     save_config_partial(repo_path, distill=distill)
+
+
+#: The hook surfaces that *replace* a tool result rather than adding to it.
+#: One consent turns them all on; each has its own ``repowise hook <name>``
+#: toggle afterwards, so a surface that turns out to be wrong can be dropped
+#: without taking the others with it.
+HOOK_REPLACEMENT_SURFACES = ("read_skeleton", "search_digest")
+
+
+def save_hook_surface_enabled(repo_path: Path, surface: str, *, enabled: bool) -> None:
+    """Deep-merge ``hooks.<surface>`` into ``.repowise/config.yaml``.
+
+    Same shape as :func:`save_distill_commands_enabled`, and written by the
+    same consent: the rewrite-hook prompt means "let repowise's hooks
+    intervene in your agent's tool calls", and rewriting a Bash command is a
+    larger intervention than serving a Read as its skeleton or a search as its
+    digest, not a smaller one. There is deliberately no second question.
+    """
+    cfg = load_config(repo_path)
+    hooks = dict(cfg.get("hooks") or {})
+    hooks[surface] = enabled
+    save_config_partial(repo_path, hooks=hooks)
 
 
 def config_fingerprint(repo_path: Path) -> str:

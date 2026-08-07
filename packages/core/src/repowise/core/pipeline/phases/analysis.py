@@ -28,11 +28,9 @@ DECISION_EXTRACTION_TIMEOUT_SECS = 300
 _DECISION_SOURCE_LABELS: tuple[tuple[str, str], ...] = (
     ("inline_marker", "from inline markers"),
     ("adr", "from ADR files"),
-    ("changelog", "from changelogs"),
     ("pr", "from pull requests"),
     ("git_archaeology", "from git history"),
     ("comment", "from comments"),
-    ("readme_mining", "from docs"),
     ("session", "from agent sessions"),
 )
 
@@ -41,6 +39,7 @@ async def _run_dead_code_analysis(
     graph_builder: Any,
     git_meta_map: dict[str, dict],
     *,
+    source_map: dict[str, bytes] | None = None,
     progress: ProgressCallback | None,
 ) -> Any | None:
     """Run dead code detection (pure graph traversal, no LLM)."""
@@ -54,7 +53,10 @@ async def _run_dead_code_analysis(
             progress.on_phase_start("dead_code", dead_code_steps)
 
         analyzer = DeadCodeAnalyzer(
-            graph_builder.graph(), git_meta_map, parsed_files=graph_builder._parsed_files
+            graph_builder.graph(),
+            git_meta_map,
+            parsed_files=graph_builder._parsed_files,
+            source_map=source_map,
         )
 
         def _step(_stage: str) -> None:

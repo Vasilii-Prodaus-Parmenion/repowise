@@ -3,7 +3,7 @@
 Two different jobs share this machinery, and telling them apart matters:
 
 **Sole renderers.** ``file_page``, ``symbol_spotlight``, ``api_contract``,
-``infra_page``, ``scc_page`` and ``layer_page`` state facts a parser knows
+``infra_page`` and ``scc_page`` state facts a parser knows
 exactly: symbols, signatures, imports, dependents, cycle membership, git
 history. A model adds nothing to that and introduces staleness, so these have
 one renderer and no model path at all. Their templates sit at
@@ -30,7 +30,14 @@ from typing import Any
 
 import structlog
 
-from ..models import GENERATION_LEVELS, GeneratedPage, compute_page_id, compute_source_hash
+from ..models import (
+    GENERATION_LEVELS,
+    STUB_PAGE_CONFIDENCE,
+    TEMPLATE_PAGE_CONFIDENCE,
+    GeneratedPage,
+    compute_page_id,
+    compute_source_hash,
+)
 from .helpers import _extract_summary, _now_iso
 
 log = structlog.get_logger(__name__)
@@ -158,6 +165,7 @@ def signature(value: object, limit: int = 120) -> str:
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 
 FILE_PAGE_TEMPLATE = "file_page.j2"
+SYMBOL_SPOTLIGHT_TEMPLATE = "symbol_spotlight.j2"
 
 # Metadata key holding a structural page's render fingerprint. It lives in
 # metadata rather than in a column of its own because ``GeneratedPage`` already
@@ -280,6 +288,50 @@ def stale_file_page_paths(
     return stale
 
 
+def stale_spotlight_paths(
+    stored_keys_by_path: Mapping[str, Iterable[str]],
+    parsed_files: Iterable[Any],
+    *,
+    language: str = "en",
+    style_fingerprint: str = "",
+    template_dir: Path | None = None,
+) -> list[str]:
+    """Files whose stored symbol spotlights came from an older renderer.
+
+    The same idea as :func:`stale_file_page_paths` and deliberately a separate
+    function, because the two are keyed differently. A file page is one page
+    per path, so it can be looked up by page id. A file has many spotlights,
+    one per selected symbol, and which symbols were selected on the run that
+    wrote them is not reconstructible here — so the caller groups the stored
+    keys by defining file and this compares against the set.
+
+    Returns **file paths**, not page ids, because regeneration is driven by
+    file: ``update`` re-parses a path and re-renders every page derived from
+    it. One stale spotlight therefore makes its defining file the unit of work.
+    """
+    fingerprint = structural_fingerprint(
+        SYMBOL_SPOTLIGHT_TEMPLATE,
+        language=language,
+        style_fingerprint=style_fingerprint,
+        template_dir=template_dir,
+    )
+    stale: list[str] = []
+    for parsed in parsed_files:
+        subject_hash = getattr(parsed, "content_hash", "") or ""
+        if not subject_hash:
+            # Same reasoning as the file-page sweep: no stable subject means no
+            # stable expectation, and treating it as stale re-renders forever.
+            continue
+        stored = stored_keys_by_path.get(parsed.file_info.path)
+        if not stored:
+            # No spotlight stored for this file is absent, not stale.
+            continue
+        expected = structural_content_hash(subject_hash, fingerprint)
+        if any(key != expected for key in stored):
+            stale.append(parsed.file_info.path)
+    return stale
+
+
 class StructuralRenderMixin:
     """Template-only renderers, mixed into PageGenerator.
 
@@ -293,12 +345,18 @@ class StructuralRenderMixin:
         target_path: str,
         title: str,
         template: str,
+        confidence: float = TEMPLATE_PAGE_CONFIDENCE,
         **render_kwargs: Any,
     ) -> GeneratedPage:
         """Render one template page and wrap it as a GeneratedPage.
 
         The mirror of ``_build_generated_page`` for the no-model path: same
         fields, zero tokens, ``provider_name="template"``.
+
+        ``confidence`` is a parameter rather than a constant because the two
+        callers make different claims. A sole renderer's page is everything the
+        page is meant to be; a stub is the same material with the prose
+        missing, and a reader has to be told which one they are looking at.
         """
         content = self._render(template, style_prefix=False, **render_kwargs)
         now = _now_iso()
@@ -318,6 +376,7 @@ class StructuralRenderMixin:
             target_path=target_path,
             created_at=now,
             updated_at=now,
+            confidence=confidence,
         )
 
     def _structural_page(
@@ -372,6 +431,7 @@ class StructuralRenderMixin:
             target_path=target_path,
             title=title,
             template=f"{_STUB_PREFIX}/{template}",
+            confidence=STUB_PAGE_CONFIDENCE,
             **render_kwargs,
         )
 
@@ -412,7 +472,7 @@ class StructuralRenderMixin:
             page_type="symbol_spotlight",
             target_path=target_path,
             title=title,
-            template="symbol_spotlight.j2",
+            template=SYMBOL_SPOTLIGHT_TEMPLATE,
             subject_hash=subject_hash,
             ctx=ctx,
         )
@@ -424,21 +484,16 @@ class StructuralRenderMixin:
             title=title,
             template="scc_page.j2",
             ctx=ctx,
+            # The heading says where the cycle is. The page id stays the hash
+            # and the page still prints it, so a log line or a link naming one
+            # still resolves.
+            page_title=title,
             # Ranked by how many cross-edges each file carries: the highest
             # is the cheapest place to break the cycle. Computed here rather
             # than in Jinja because the template language makes grouping
             # painful and this is the one genuinely useful thing the page can
             # say that the LLM page says in prose.
             decouple_ranking=_rank_cycle_participants(ctx),
-        )
-
-    def _structural_layer_page(self, ctx: Any, title: str) -> GeneratedPage:
-        return self._structural_page(
-            page_type="layer_page",
-            target_path=ctx.layer_id,
-            title=title,
-            template="layer_page.j2",
-            ctx=ctx,
         )
 
     def _structural_api_contract(
@@ -522,6 +577,35 @@ class StructuralRenderMixin:
         )
         page.metadata["subkind"] = spec.slot
         page.metadata["onboarding_slot"] = spec.slot
+        return page
+
+    def _model_free_onboarding_page(self, spec: Any, ctx: Any, target_path: str) -> GeneratedPage:
+        """Render a subkind that is finished without a model, not stubbed.
+
+        The same template, and a different claim about it. A stub is real
+        material with the prose missing, so it sits below the reader UI's
+        banner threshold and the tree offers to have a model write it. A
+        ``deterministic`` subkind is already everything its page is meant to
+        be — every statement on it came from the index and no model saw it —
+        which is exactly the claim :data:`TEMPLATE_PAGE_CONFIDENCE` makes.
+
+        ``model_free`` is stamped for the consumers that would otherwise read
+        ``provider_name='template'`` as "unwritten": scope resolution would
+        offer this page to ``generate --unwritten`` forever, and the web reader
+        would mark it "a model has not written this page yet" — on a page no
+        model is ever going to write.
+        """
+        page = self._render_page(
+            page_type="onboarding",
+            target_path=target_path,
+            title=spec.title,
+            template=f"{_STUB_PREFIX}/onboarding/{spec.template}",
+            ctx=ctx,
+            slot=spec.slot,
+        )
+        page.metadata["subkind"] = spec.slot
+        page.metadata["onboarding_slot"] = spec.slot
+        page.metadata["model_free"] = True
         return page
 
 

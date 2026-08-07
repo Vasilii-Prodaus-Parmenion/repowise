@@ -23,6 +23,8 @@ Extension/filename -> LanguageTag  (via LanguageRegistry)
         |
         +-- Config/data language?  -> empty ParsedFile (passthrough)
         +-- Special format?        -> special_handlers.py (OpenAPI/Dockerfile/Makefile/SQL)
+        +-- Multi-language file?   -> sfc_source.py projects it to one
+        |                             grammar's language at identical offsets
         +-- Has grammar?           -> tree-sitter AST parsing
                 |
                 v
@@ -44,7 +46,9 @@ Extension/filename -> LanguageTag  (via LanguageRegistry)
                   (src/ + monorepo packages/*/src + PEP 420 namespace
                   packages), __init__.py re-export barrels, stem fallback
           TS/JS:  relative paths, tsconfig aliases, workspace exports,
-                  `export ... from` re-export barrels, node_modules
+                  `export ... from` re-export barrels, node_modules,
+                  package.json "imports" (`#alias/*`) subpath imports
+          Svelte: the TS/JS resolver plus SvelteKit's `$lib` -> src/lib
           Go:     go.mod module path stripping
           Rust:   crate::/self::/super::, mod.rs probing
           C/C++:  compile_commands.json include directories
@@ -112,6 +116,7 @@ ingestion/
     registry.py        #   HintRegistry
     django.py  pytest_hints.py  python_imports.py  node.py  dotnet.py
     spring.py  ruby.py  php.py  scala.py  swift.py  c.py  cpp.py  luau.py  go.py  jvm.py
+  sfc_source.py        # Multi-language-file (SFC) projection (see below)
   parser.py            # ASTParser (language-agnostic orchestration)
   graph.py             # GraphBuilder (import/call/heritage resolution)
 
@@ -168,8 +173,10 @@ SPEC = LanguageSpec(
 Then register it in `languages/specs/__init__.py` by importing the module and
 slotting it into the `ALL_SPECS` tuple. **Order matters**: `LanguageRegistry`
 builds its extension map first-spec-wins, so place more specific languages
-ahead of ones that share an extension (e.g. TypeScript before JavaScript). You
-never edit `registry.py` itself.
+ahead of ones that share an extension (e.g. TypeScript before JavaScript). A
+spec using `shares_grammar_with` must also come *after* the spec it borrows
+from, which is resolved against the registry built so far. You never edit
+`registry.py` itself.
 
 ### Step 2: Add the `LanguageTag`
 
@@ -196,7 +203,10 @@ tree-sitter S-expression syntax. Follow the capture-name conventions:
 | `@call.receiver` | Object the call is made on | No |
 | `@call.arguments` | Call arguments | No |
 
-`python.scm` and `typescript.scm` are good starting points.
+`python.scm` and `typescript.scm` are good starting points. A language whose
+syntax *is* another's can skip this step entirely by pointing `scm_file` at the
+existing query file — that field names the query to load, so `svelte` declares
+`scm_file="typescript.scm"` and writes no `.scm` of its own.
 
 ### Step 4: Add a `LanguageConfig` entry
 
@@ -345,6 +355,26 @@ per-language plugin pattern, registered in a dict exactly like `resolvers/`:
   Java/Go contribute `regex_compile_in_loop`, C# contributes
   `blocking_sync_in_async`, and the Phase-7a loop markers are opt-in per
   dialect. Every method has a safe "no signal" default.
+
+  Three hooks answer questions that recur in every language, so a new dialect
+  reuses them instead of re-deriving them:
+  - `block_loop_body(node)` — the per-iteration body when the language's real
+    iteration idiom is a call taking a block/lambda (Ruby `items.each do … end`,
+    Kotlin `ids.forEach { … }`). The walker then applies every loop rule (body
+    scoping, constant-bound skip, nesting, the same-collection quadratic gate)
+    to it exactly as to a native loop. A lambda returned this way is *not*
+    treated as a deferred scope, so `loop_depth` survives the boundary.
+  - `loop_body(node)` — the per-iteration body of a *native* loop, defaulting to
+    the `body` field. Only tree-sitter-kotlin leaves that field unlabeled; the
+    override is what keeps a sink in a `for (u in repo.findAll())` **header**
+    from reading as a sink inside the loop.
+  - `resets_per_iteration(node, name, loop_kinds)` + `binds_name(node, name)` —
+    the shared answer to the top `string_concat_in_loop` false positive, an
+    accumulator declared fresh each pass (`var s = ""; s += part`) which is
+    bounded per iteration rather than an O(n²) rebuild. The traversal is shared;
+    only the "does this statement bind the name" question is per-grammar. (The
+    Python, Ruby and Dart dialects predate the hook and keep their own tuned
+    versions.)
 - **`analysis/health/dataflow/dialects/`** (`DEFUSE_DIALECTS`), the
   **dataflow** layer (intra-procedural CFG + def/use + reaching definitions,
   powering **Extract Method**). A `DefUseDialect` owns the read-vs-write
@@ -354,6 +384,17 @@ per-language plugin pattern, registered in a dict exactly like `resolvers/`:
   `LanguageNodeMap`). The full pass runs only for functions a structural marker
   already flagged (`large_method` / `brain_method` / `complex_method`), so it
   stays within the health-pass budget.
+
+  A dialect is only half the requirement: the CFG builder resolves bodies,
+  conditions and jumps through *field names* (`body` / `consequence` /
+  `alternative`) and *node types* (`break_kinds` / `continue_kinds`), so a
+  grammar that labels none of them cannot be served by a dialect alone. The
+  slicer additionally refuses any span containing a jump — which means an
+  untyped jump is worse than no signal, because it would license an extraction
+  that silently changes control flow. `find_extractions` also refuses a function
+  whose subtree carries a parse error (`Node.has_error`): macro-heavy C/C++
+  headers make tree-sitter emit one bogus `function_definition` spanning a whole
+  class, and proposing to lift "statements" out of that is a wrong suggestion.
 
 All tiers are purely additive and degrade to silence: an unmapped language
 produces no findings rather than wrong ones.

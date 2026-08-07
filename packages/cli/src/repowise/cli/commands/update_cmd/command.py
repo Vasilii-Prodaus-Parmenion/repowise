@@ -66,6 +66,13 @@ from .workspace import _workspace_update
 
 log = structlog.get_logger(__name__)
 
+#: How far back the hook-efficacy classifier re-reads transcripts on an update.
+#: Wider than the update cadence on purpose: a firing near the end of a session
+#: has no following tool calls yet, so re-running over the same transcript later
+#: is what upgrades an early "ignored" to the truth. Re-classification is
+#: idempotent (the ledger id is a hash of the firing's own text).
+_EFFICACY_LOOKBACK_SECONDS = 7 * 86400.0
+
 
 def _docs_provider_prompt_allowed(emitter: Any) -> bool:
     """Whether a docs run may block on an interactive provider prompt.
@@ -435,24 +442,34 @@ def _head_commit_ts(repo_path) -> float | None:
 
 
 def _current_renderer_fingerprint(repo_path) -> str:
-    """This release's fingerprint for the file-page renderer, or '' on failure.
+    """This release's fingerprint for the structural renderers, or '' on failure.
 
-    Cheap: reads one template and a few constants, no parse. An empty result
+    Covers every template with no model path behind it, because this value is
+    what decides whether a repository with no new commits is "already up to
+    date". Fingerprinting only the file page meant a release that improved the
+    spotlight template alone returned before doing anything, and the change
+    never reached an existing wiki.
+
+    Cheap: reads the templates and a few constants, no parse. An empty result
     disables the renderer-staleness gate for this run rather than risking a
     spurious full re-render, which is the safe direction.
     """
     try:
         from repowise.core.generation.page_generator.structural import (
             FILE_PAGE_TEMPLATE,
+            SYMBOL_SPOTLIGHT_TEMPLATE,
             structural_fingerprint,
         )
 
         language, style_fp, template_dir = _renderer_inputs(repo_path)
-        return structural_fingerprint(
-            FILE_PAGE_TEMPLATE,
-            language=language,
-            style_fingerprint=style_fp,
-            template_dir=template_dir,
+        return ":".join(
+            structural_fingerprint(
+                template,
+                language=language,
+                style_fingerprint=style_fp,
+                template_dir=template_dir,
+            )
+            for template in (FILE_PAGE_TEMPLATE, SYMBOL_SPOTLIGHT_TEMPLATE)
         )
     except Exception as exc:
         log.debug("update.renderer_fingerprint_failed", error=str(exc))
@@ -460,7 +477,11 @@ def _current_renderer_fingerprint(repo_path) -> str:
 
 
 def _stale_renderer_paths(repo_path, parsed_files) -> list[str]:
-    """File paths whose stored page predates the current structural renderer.
+    """File paths whose stored pages predate the current structural renderers.
+
+    Covers file pages and symbol spotlights. Both sweeps return file paths, so
+    the union is the set of files to re-parse; regenerating a file re-renders
+    every page derived from it, including its spotlights.
 
     Never raises: a failure here means the run behaves exactly as it did
     before the fingerprint existed, which is the safe direction. The style and
@@ -468,21 +489,29 @@ def _stale_renderer_paths(repo_path, parsed_files) -> list[str]:
     would look stale on every run.
     """
     try:
-        from repowise.core.generation.page_generator.structural import stale_file_page_paths
-
-        from .deterministic import load_file_page_render_keys
-
-        stored = load_file_page_render_keys(repo_path)
-        if not stored:
-            return []
-        language, style_fp, template_dir = _renderer_inputs(repo_path)
-        return stale_file_page_paths(
-            stored,
-            parsed_files,
-            language=language,
-            style_fingerprint=style_fp,
-            template_dir=template_dir,
+        from repowise.core.generation.page_generator.structural import (
+            stale_file_page_paths,
+            stale_spotlight_paths,
         )
+
+        from .deterministic import load_file_page_render_keys, load_spotlight_render_keys
+
+        parsed_files = list(parsed_files)
+        language, style_fp, template_dir = _renderer_inputs(repo_path)
+        kwargs = {
+            "language": language,
+            "style_fingerprint": style_fp,
+            "template_dir": template_dir,
+        }
+
+        stale: list[str] = []
+        stored_pages = load_file_page_render_keys(repo_path)
+        if stored_pages:
+            stale.extend(stale_file_page_paths(stored_pages, parsed_files, **kwargs))
+        stored_spotlights = load_spotlight_render_keys(repo_path)
+        if stored_spotlights:
+            stale.extend(stale_spotlight_paths(stored_spotlights, parsed_files, **kwargs))
+        return list(dict.fromkeys(stale))
     except Exception as exc:
         log.debug("update.stale_renderer_check_failed", error=str(exc))
         return []
@@ -771,6 +800,13 @@ def run_update(
             )
         except Exception as exc:
             log.debug("reindex_notice_skipped", error=str(exc))
+        # Up-to-date code does not mean a complete wiki either. This path is
+        # where an orientation page registered after the index was built is
+        # most likely to go unmentioned forever: it returns before the
+        # generation code, so nothing else in the run can notice.
+        from .slot_notice import surface_missing_slots
+
+        surface_missing_slots(repo_path, emitter=emitter, dry_run=dry_run)
         if emitter is not None:
             emitter.done(
                 ok=True,
@@ -794,16 +830,30 @@ def run_update(
     # longer both pass a separate read check and race anyway.
     existing_lock = try_acquire_update_lock(repo_path, head)
     if existing_lock is not None:
-        import time as _time
+        from repowise.core.update_lock import (
+            UPDATE_LOCK_SUSPECT_AFTER_SECONDS,
+            format_lock_age,
+            lock_age_seconds,
+        )
 
-        elapsed = int(_time.time() - existing_lock.get("started_at", _time.time()))
+        age = lock_age_seconds(existing_lock)
         target_short = (existing_lock.get("target_commit") or "")[:8]
         write_update_pending(repo_path, head)
         console.print(
             f"[yellow]Another `repowise update` is already running "
             f"(pid {existing_lock.get('pid')}, target {target_short}, "
-            f"started {elapsed}s ago).[/yellow]"
+            f"holding the lock {format_lock_age(age)}).[/yellow]"
         )
+        # An owner we can see running is never evicted on age alone, so a run
+        # that has stopped progressing would otherwise block every later update
+        # with nothing to act on. Say how long it has been and where to look.
+        if age is not None and age > UPDATE_LOCK_SUSPECT_AFTER_SECONDS:
+            console.print(
+                "[yellow]That is longer than an update normally takes. If "
+                "[bold].repowise/.update.log[/bold] has not been written to in "
+                f"that time, pid {existing_lock.get('pid')} is stuck and can be "
+                "stopped; this repo will update on the next run.[/yellow]"
+            )
         console.print(
             f"[dim]HEAD {head[:8] if head else 'HEAD'} marked as pending; "
             "the running update will roll forward to it. This run regenerated "
@@ -878,6 +928,13 @@ def run_update(
             _surface_release_news(written_by=verdict.written_by)
     except Exception as exc:  # never block a routine update on the upgrade layer
         log.debug("store_upgrade_skipped", error=str(exc))
+
+    # An orientation page registered after this index was built cannot arrive
+    # below, because this run's parsed_files is the changed-file slice, so name
+    # the command that does reach it. Says nothing when there is nothing to say.
+    from .slot_notice import surface_missing_slots
+
+    surface_missing_slots(repo_path, emitter=emitter, dry_run=dry_run)
 
     render_header(repo_path, base_ref, head)
 
@@ -1043,7 +1100,7 @@ def run_update(
         return UpdateOutcome.DRY_RUN
 
     partial_health_report, dead_code_report = _run_partial_analysis(
-        repo_path, graph_builder, git_meta_map, parsed_files, file_diffs
+        repo_path, graph_builder, git_meta_map, parsed_files, file_diffs, source_map
     )
 
     # Partial health has consumed the per-file ``BlameIndex``; drop it before
@@ -1323,6 +1380,25 @@ def run_update(
         degraded.append(f"Injection feedback: {exc}")
         if verbose:
             console.print(f"[yellow]Injection feedback skipped: {exc}[/yellow]")
+
+    # The same feedback question for the non-decision hook surfaces. Those
+    # firings point at a file or a search result rather than a decision record,
+    # so they are judged by what the agent did next — which only the transcript
+    # knows. Scoped to transcripts touched since the last update; the whole
+    # history is a one-off `repowise hook backfill`.
+    try:
+        from repowise.core.sessions.efficacy import ingest_transcript_efficacy
+
+        if session_mining_enabled(cfg):
+            classified = ingest_transcript_efficacy(
+                repo_path, since=time.time() - _EFFICACY_LOOKBACK_SECONDS
+            )
+            if verbose and classified:
+                console.print(f"Hook firings classified: [green]{sum(classified.values())}[/green]")
+    except Exception as exc:
+        degraded.append(f"Hook efficacy: {exc}")
+        if verbose:
+            console.print(f"[yellow]Hook efficacy classification skipped: {exc}[/yellow]")
 
     # Count of decision records touched by evolution, surfaced in the panel.
     decisions_evolved = 0
@@ -1711,6 +1787,5 @@ def run_update(
         elapsed=elapsed,
         degraded=degraded,
     )
-    if verbose:
-        _render_update_report(generated_pages, affected, new_decision_markers, elapsed)
+    _render_update_report(generated_pages, affected, new_decision_markers, elapsed, detail=verbose)
     return UpdateOutcome.REGENERATED

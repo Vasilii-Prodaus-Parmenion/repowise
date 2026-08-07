@@ -56,8 +56,6 @@ it is the only one that needs a provider.
 | Inline markers | `inline_marker` | `# WHY:` / `# DECISION:` / `# TRADEOFF:` / `# ADR:` / `# RATIONALE:` / `# REJECTED:` | Any comment syntax (`#`, `//`, `--`, `/*`, `*`). Up to 5 continuation lines, plus 20 lines of surrounding context. Fenced code blocks in Markdown are skipped. |
 | Git archaeology | `git_archaeology` | Commit messages | Gated on 19 decision verbs (migrate, switch to, replace, adopt, deprecate, drop, rewrite, split, revert, and the rest). |
 | PR bodies | `pr` | Squash-merge and PR commit bodies | A body only qualifies when it looks like a PR description (`## Why`, `## Motivation`, `## Context`, `Closes #`, `Before:` / `After:`). Up to 25 bodies. |
-| CHANGELOG | `changelog` | `CHANGELOG` / `HISTORY` / `NEWS` / `CHANGES` / release notes | keep-a-changelog `Changed` / `Removed` / `Deprecated` / `Security` sections only. `Added` is deliberately excluded: a new feature is rarely a structural decision. Up to 15 versions. |
-| README and docs | `readme_mining` | README and docs prose | Implicit decisions stated in prose. |
 | Code comments | `comment` | Block comments and docstrings on high-centrality files | Bounded to 30 nodes, and to prose carrying a rationale cue ("because", "instead of", "rather than", "trade-off", "we chose", "deliberately"). Centrality-bounded on purpose: comment archaeology across a whole repo is noise. |
 | Doc generation | `llm_inferred` | The wiki generation pass | The page generator proposes decisions it inferred while writing a page. Every field must survive the grounding gate below. |
 
@@ -74,9 +72,7 @@ decisions:
     comment: false          # skip comment archaeology
     # inline_marker: false
     # git_archaeology: false
-    # readme_mining: false
     # adr: false
-    # changelog: false
     # pr: false
 ```
 
@@ -112,9 +108,13 @@ confidence = 0.4 + 0.5 * (best_source_rank / 9)
            x verification penalty
 ```
 
-The rank ladder is `cli` 9, `adr` 8, `session` and `pr` 7, `commit` and
-`git_archaeology` 6, `changelog` 5, `inline_marker` 4, `comment` and
-`readme_mining` 3, and the heuristic tiers below that. The result is clamped to
+The rank ladder is `cli` 9, `session` 8, `adr` and `pr` 7, `commit` and
+`git_archaeology` 6, `inline_marker` 4, `comment` 3, and the heuristic tiers
+below that. `session` sits above `adr` because a transcript carries what a person
+actually said while deciding, and a document is someone's later write-up of it;
+with the order reversed the write-up overwrote the words. Retired sources keep
+their rungs (`changelog` 5, `readme_mining` 3) so rows written before their
+removal still rank instead of dropping to the unknown-source floor. The result is clamped to
 `[0, 0.99]`: nothing is ever certain.
 
 **Sources corroborate, they do not overwrite.** The same decision found in an ADR
@@ -129,17 +129,31 @@ Decisions are not a flat list. Typed edges connect them:
 
 | Edge | Meaning |
 |------|---------|
-| `supersedes` | The newer decision replaces the older one. Above 0.85 supersession confidence the older record auto-flips to `superseded`; below that it is recorded as a reviewable proposal instead. |
+| `supersedes` | The newer decision replaces the older one, and the older record flips to `superseded`. |
 | `refines` | Narrows or extends a decision without reversing it. |
 | `relates_to` | Same topic, no ordering claim. |
 | `conflicts_with` | Two *active* decisions contradict each other. A governance smell, surfaced in `decision health` and in the code-health layer. |
 
-Detection is deterministic first. Two decisions have to share a topic (at least
+**Automatic detection of these two edges is currently off.** It scoped a
+conflict by embedding similarity: two decisions had to share a topic (at least
 two shared content tokens after stopword removal) and then either straddle an
 opposing verb pair (`adopt` / `use` / `introduce` against `drop` / `remove` /
 `deprecate` / `revert`) or carry a reversal signal ("replace", "migrate",
-"switch to", "no longer", "in favor of"). An LLM tiebreaker only runs on the
-pairs the heuristic cannot call.
+"switch to", "no longer", "in favor of"), with an LLM tiebreaker on the pairs
+the heuristic could not call. In practice similarity does not scope: among
+descriptions drawn from one repository, a cosine of 0.81 is the baseline rather
+than evidence of a shared topic, so the check fired between unrelated records
+and retired records that were correct. It returns when a conflict is scoped
+structurally — by two decisions touching the same code — with similarity used
+only to rank the candidates that test finds.
+
+It was the only writer of these edges, so **no edges exist while it is off** and
+lineage is empty. Two things still work: the diff-driven evolution pass on
+`repowise update` marks a decision that a new commit reversed, and `repowise
+decision deprecate --superseded-by ID` records the successor on the record
+itself (the `superseded_by` column, not an edge). Records the detector retired
+before it was turned off are restored to `proposed` on the next `init` or
+`update`, and its edges are deleted in the same pass.
 
 `supersedes` and `refines` chain into a **lineage**, so `get_why` can answer
 "why is auth structured this way?" with `sessions -> JWT -> OAuth2` rather than
@@ -244,7 +258,7 @@ the primary repo. Decision ids accept an 8-character prefix.
 | Flag | Values |
 |------|--------|
 | `--status` | `proposed`, `active`, `deprecated`, `superseded`, `dismissed`, `all` (default) |
-| `--source` | `git_archaeology`, `inline_marker`, `readme_mining`, `cli`, `all` (default) |
+| `--source` | any source in the rank ladder except the retired ones, plus `all` (default) |
 | `--proposed` | Shortcut for `--status proposed` |
 | `--stale-only` | Only records with staleness at or above 0.5 |
 

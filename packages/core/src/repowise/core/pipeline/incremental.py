@@ -157,6 +157,7 @@ def build_repo_graph(
         include_submodules=include_submodules,
         include_nested_repos=include_nested_repos,
     )
+    graph_builder.set_source_map(source_map)
     graph_builder.build()
     if parse_cache is not None:
         parse_cache.save()
@@ -309,12 +310,16 @@ def run_partial_analysis(
     parsed_files: list,
     file_diffs: list,
     *,
+    source_map: dict[str, bytes] | None = None,
     log: LogFn | None = None,
 ) -> tuple[Any, Any]:
     """Run partial code-health + dead-code analysis for the changed files.
 
     Returns ``(partial_health_report, dead_code_report)`` — either may be
     ``None`` if its analysis failed (both are best-effort).
+
+    *source_map* is ingestion's ``{path: raw bytes}`` for this rebuild; the
+    dead-code prepasses read it instead of re-reading the repo from disk.
     """
     log = log or _noop_log
 
@@ -362,7 +367,10 @@ def run_partial_analysis(
         # parsed_files enables the source-scan rescues (dynamic markers,
         # bundler aliases, export aliases) on the update path, matching init.
         _analyzer_partial = DeadCodeAnalyzer(
-            graph_builder.graph(), git_meta_map, parsed_files=graph_builder._parsed_files
+            graph_builder.graph(),
+            git_meta_map,
+            parsed_files=graph_builder._parsed_files,
+            source_map=source_map,
         )
         _changed_paths_partial = [fd.path for fd in file_diffs]
         dead_code_report = _analyzer_partial.analyze_partial(_changed_paths_partial)
@@ -936,6 +944,11 @@ async def persist_incremental_index(
 
     url = resolve_db_url(repo_path)
     engine = create_engine(url)
+    # Filled by the tombstone step; read after the session closes, so it has to
+    # survive a step that was skipped.
+    tombstoned_page_ids: list[str] = []
+    # Same contract, for rows of a page that has been retired outright.
+    swept_page_ids: list[str] = []
     try:
         await init_db(engine)
         sf = create_session_factory(engine)
@@ -952,6 +965,18 @@ async def persist_incremental_index(
                 except Exception as exc:
                     _skip("Stale row prune", exc)
 
+            # Delete rows of pages retired since this index was built. This
+            # path never regenerates a repo-wide page, so nothing else here
+            # would ever visit one to notice it should be gone, and for a user
+            # whose updates all come from the post-commit hook this is the only
+            # place a retirement can land.
+            try:
+                from repowise.core.pipeline.persist import sweep_retired_pages
+
+                swept_page_ids = await sweep_retired_pages(session, repo_id)
+            except Exception as exc:
+                _skip("Retired page sweep", exc)
+
             # Tombstone pages for deleted/renamed files FIRST — a fresh page
             # for a file that no longer exists misleads every retrieval
             # consumer until the next full regeneration.
@@ -962,7 +987,9 @@ async def persist_incremental_index(
                         tombstone_candidates,
                     )
 
-                    await mark_tombstone_pages(session, repo_id, tombstone_candidates(file_diffs))
+                    tombstoned_page_ids = await mark_tombstone_pages(
+                        session, repo_id, tombstone_candidates(file_diffs)
+                    )
                 except Exception as exc:
                     _skip("Tombstone marking", exc)
 
@@ -1104,5 +1131,38 @@ async def persist_incremental_index(
                 await purge_proposed_decisions_by_source(session, repo_id, "code_comment")
             except Exception as exc:
                 _skip("Decision purge", exc)
+
+        # After the session closes: on SQLite the full-text index shares the
+        # database file, so writing to it while the session holds a write lock
+        # raises "database is locked".
+        #
+        # A tombstone can never be an answer — hydration drops it — but
+        # retrieval fetches a fixed number of rows before that check runs, so
+        # every tombstone left in the index costs a real candidate its slot.
+        #
+        # A swept page's FTS row is worse than a tombstone: search hydrates
+        # title and snippet from the FTS copy itself, so an orphan answers in
+        # full while the page it names 404s.
+        if tombstoned_page_ids or swept_page_ids:
+            try:
+                from repowise.core.persistence.search import FullTextSearch
+
+                fts = FullTextSearch(engine)
+                await fts.ensure_index()
+                if tombstoned_page_ids:
+                    await fts.delete_many(tombstoned_page_ids)
+                if swept_page_ids:
+                    await fts.delete_many(swept_page_ids)
+            except Exception as exc:
+                _skip("Tombstone full-text removal", exc)
+
+        # Ceiling: the swept pages' *vector* embeddings survive this path.
+        # There is no store here to delete them from, and building one would
+        # pull the lancedb import onto the post-commit hook, which
+        # ``deterministic.py`` avoids on purpose — and with the default mock
+        # embedder this path never wrote a page embedding in the first place.
+        # LanceDB hydrates a hit from its own columns, so a residual embedding
+        # can still surface in semantic search until the next docs-mode update
+        # (which does delete it) or a reindex.
     finally:
         await engine.dispose()

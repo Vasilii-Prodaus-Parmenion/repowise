@@ -24,6 +24,7 @@ when ``--full`` is passed.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,7 @@ from repowise.cli.helpers import (
     resolve_reasoning,
     run_async,
     save_state,
+    stamp_offered_slots,
 )
 from repowise.core.docs_mode import docs_mode_state_fields
 
@@ -320,7 +322,13 @@ async def _run_upgrade(
         fts = FullTextSearch(engine)
         await fts.ensure_index()
         for page in generated_pages:
-            await fts.index(page.page_id, page.title, page.content)
+            await fts.index(
+                page.page_id,
+                page.title,
+                page.content,
+                summary=page.summary,
+                target_path=page.target_path,
+            )
     except Exception:
         pass  # FTS indexing is best-effort
 
@@ -352,7 +360,7 @@ async def _run_upgrade(
                 if health_report.findings:
                     await save_health_findings(session, repo_id, health_report.findings)
                 kpis = health_report.kpis or {}
-                try:
+                with contextlib.suppress(Exception):  # snapshot is best-effort
                     await save_health_snapshot(
                         session,
                         repo_id,
@@ -365,8 +373,6 @@ async def _run_upgrade(
                             for m in health_report.metrics or []
                         },
                     )
-                except Exception:
-                    pass  # snapshot is best-effort
             console.print(
                 f"Code health recomputed at FULL tier: "
                 f"[cyan]{len(health_report.findings)}[/cyan] findings."
@@ -506,6 +512,11 @@ def upgrade_to_full(
     # `update --full` regenerates the whole wiki (concept tree included), so it
     # brings the store to the terminal store format the same way a full init
     # does. Stamp it as such rather than clamping at the reindex gate.
+    #
+    # This is also the run that answers the missing-slot notice: it evaluates
+    # every registered onboarding slot against whole-repo signals, so after it
+    # there is nothing left for the notice to report.
+    stamp_offered_slots(state, enabled=config.enable_onboarding)
     save_state(repo_path, state, full_index=True)
     if embedder_name and embedder_name != cfg.get("embedder"):
         from repowise.cli.helpers import save_config_partial
