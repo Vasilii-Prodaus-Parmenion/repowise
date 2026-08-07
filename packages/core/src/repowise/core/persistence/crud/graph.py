@@ -86,6 +86,7 @@ async def batch_upsert_graph_nodes(
             repository_id=repository_id,
             **{k: v for k, v in n.items() if k not in ("id", "repository_id")},
         ),
+        batch_size=_BATCH_SIZE,
     )
 
 
@@ -123,6 +124,7 @@ async def batch_upsert_graph_edges(
             edge_type=e.get("edge_type", "imports"),
             confidence=e.get("confidence", 1.0),
         ),
+        batch_size=_BATCH_SIZE,
     )
 
 
@@ -251,6 +253,7 @@ async def batch_upsert_graph_metrics(
             in_degree=int(kv[1].get("in_degree", 0)),
             out_degree=int(kv[1].get("out_degree", 0)),
         ),
+        batch_size=_BATCH_SIZE,
     )
 
 
@@ -287,6 +290,7 @@ async def batch_upsert_graph_node_membership(
                 else int(kv[1]["symbol_community_id"])
             ),
         ),
+        batch_size=_BATCH_SIZE,
     )
 
 

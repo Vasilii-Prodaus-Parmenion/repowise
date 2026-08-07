@@ -18,7 +18,7 @@ from ..models import (
     _new_uuid,
     _now_utc,
 )
-from ._shared import _batch_upsert_keyed
+from ._shared import _BATCH_SIZE, _batch_upsert_keyed
 
 # ---------------------------------------------------------------------------
 # ExternalSystem CRUD
@@ -214,6 +214,7 @@ async def batch_upsert_symbols(
         row_key_fn=lambda row: row.symbol_id,
         update_fn=_update_wiki_symbol,
         insert_fn=lambda sym: _new_wiki_symbol(repository_id, sym),
+        batch_size=_BATCH_SIZE,
     )
 
 

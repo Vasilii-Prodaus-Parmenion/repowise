@@ -118,6 +118,12 @@ class _GenerationRun:
         self.betweenness = graph_builder.betweenness_centrality()
         self.community = graph_builder.community_detection()
         self.sccs = graph_builder.strongly_connected_components()
+        # The four metric calls above are what populate GraphBuilder's cached
+        # file/symbol subgraph copies (see release_subgraph_caches). Nothing
+        # from here on calls file_subgraph()/symbol_subgraph() directly — only
+        # graph()/pagerank()/etc — so free those two copies now rather than
+        # carrying them through the rest of generation on a large repo.
+        graph_builder.release_subgraph_caches()
 
         # ---- Per-file signal maps ----
         self.dead_code_by_file = build_dead_code_map(dead_code_report)

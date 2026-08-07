@@ -155,6 +155,23 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         self._file_subgraph_cache = None
         self._symbol_subgraph_cache = None
 
+    def release_subgraph_caches(self) -> None:
+        """Drop the cached filtered-subgraph copies, keeping the full graph.
+
+        ``file_subgraph()``/``symbol_subgraph()`` each cache a full
+        ``.copy()`` of their filtered view the first time a metric needs one
+        (SCCs, pagerank, betweenness, community detection). On a large repo
+        (100k+ symbol nodes) those two copies sit in memory for the rest of
+        the run even though nothing past metric computation reads them —
+        generation only ever calls ``graph()``/``pagerank()``/etc., never
+        ``file_subgraph()``/``symbol_subgraph()`` directly. Call this once
+        those metrics have been read (e.g. right after
+        ``_GenerationRun.__init__`` snapshots them) to free the two copies;
+        they will simply be rebuilt from ``self._graph`` if anything calls a
+        metric method again later.
+        """
+        self._invalidate_subgraph_caches()
+
     def release_graph(self) -> None:
         """Drop the in-memory NetworkX object after metrics are materialized.
 

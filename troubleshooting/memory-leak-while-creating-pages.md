@@ -1,6 +1,8 @@
 # Memory leak: OOM during "Generating Pages" on `repowise init --index-only --yes`
 
-**Status:** Root cause #1 fixed. #2 is architectural (deferred). #4a/#4b deferred (later phase, not hit by this crash).
+**Status:** Root cause #1 fixed (stopped the crash). Follow-up report: run now completes
+but peaks at ~30GB RSS — root causes #5 and #6 below fixed; #2 remains architectural
+(deferred). #4a/#4b deferred (later phase, not yet hit).
 
 ## Report
 
@@ -176,3 +178,128 @@ Issues #2, #4a and #4b are documented above but deliberately left unfixed in thi
 commit — #2 is architectural (would need the finalize passes reworked to not require
 the whole page list in memory), and #4a/#4b address a later phase this specific crash
 never reached.
+
+## Follow-up report: no crash, but 30GB peak RSS, not freed
+
+With #1 fixed, the same `securewebsite`/`back-office` scan now **completes
+successfully** — no OOM — but peak RSS still reaches **~30GB**, and the reporter
+observed the memory as "not freed" afterward.
+
+Re-traced the whole run (ingestion → analysis → generation → persistence), not just
+the generation phase this time, since nothing at the "Generating Pages" step alone
+accounts for 30GB once #1 is fixed. Findings:
+
+### 5. Un-batched bulk upserts for graph nodes/edges/symbols — new primary suspect
+
+**Confidence: high · Impact: high · Fix risk: low · Status: fixed**
+
+`_batch_upsert_keyed()` (`persistence/crud/_shared.py:40-89`) takes an optional
+`batch_size`. When it's `None` (the default), it does `chunks = [materialized]` — the
+*entire* input list becomes one chunk: every ORM object is constructed and
+`session.add()`-ed, then **one `session.flush()`** sends the whole batch at once.
+`git.py`'s four call sites correctly pass `batch_size=_BATCH_SIZE` (500). The graph and
+symbol call sites did not, despite `batch_upsert_graph_nodes`'s own docstring claiming
+"in batches of up to 500":
+
+- `batch_upsert_graph_nodes` (`persistence/crud/graph.py`) — was flushing all
+  **~140,240** `GraphNode` rows in one call
+- `batch_upsert_graph_edges` (same file) — all **~254,332** `GraphEdge` rows
+- `batch_upsert_graph_metrics` (same file) — all **~13,088** `GraphMetric` rows
+- `batch_upsert_graph_node_membership` (same file) — up to **~130,000**
+  `GraphNodeMembership` rows
+- `batch_upsert_symbols` (`persistence/crud/external_systems.py`) — all **~114,716**
+  `WikiSymbol` rows
+
+Each call site also pre-materializes a plain-dict/tuple precursor list before building
+the ORM objects (`persist.py`'s `persist_graph_nodes`, the `edges`/`all_symbols` loops
+in `persist_ingestion`), so the peak briefly held: the precursor list + every freshly
+built ORM instance + (on an update) every pre-existing row loaded for matching — all in
+one `AsyncSession`, all while the full `PipelineResult` from ingestion/analysis/
+generation (graph, parsed_files, generated_pages/`all_pages`) is *still* resident,
+since persistence runs on the same in-memory result (see #6). Chunking the flush is
+exactly what `git.py` already does for its four call sites; the graph/symbol call sites
+were simply missed.
+
+**Fix:** pass `batch_size=_BATCH_SIZE` at all five call sites, matching `git.py`'s
+existing pattern (`persistence/crud/graph.py`, `persistence/crud/external_systems.py` —
+the latter needed the `_BATCH_SIZE` import added too).
+
+### 6. `GraphBuilder`'s cached file/symbol subgraph copies — secondary fix
+
+**Confidence: high · Impact: medium · Fix risk: low · Status: fixed**
+
+`GraphBuilder` holds one combined `nx.DiGraph()` with both file and symbol nodes
+(`ingestion/graph/builder.py:52`), not two separate graphs. But `file_subgraph()` and
+`symbol_subgraph()` (`ingestion/graph/_metrics.py:80-135`) each do a
+`g.subgraph(nodes).copy()` the first time a metric needs one (SCCs, pagerank,
+betweenness, community detection), and cache the result on
+`_file_subgraph_cache`/`_symbol_subgraph_cache` for the builder's lifetime. So at
+steady state there are **three live NetworkX graphs**: the full graph plus a full copy
+of its file-only and symbol-only subsets. `_GenerationRun` (`orchestrate.py`) holds the
+`graph_builder` (and therefore both cached copies) for the entire generation phase, but
+nothing in generation calls `file_subgraph()`/`symbol_subgraph()` directly — only
+`graph()`/`pagerank()`/`betweenness_centrality()`/`community_detection()`/
+`strongly_connected_components()`, whose results are snapshotted into plain dicts
+(`self.pagerank`, `self.betweenness`, ...) in `_GenerationRun.__init__`. The two cached
+subgraph copies are dead weight from that point on.
+
+This is the (worse, whole-graph) sibling of `release_graph()` (`builder.py:157-172`),
+which already exists but is explicitly scoped to pipelines that need *no* further graph
+traversal (e.g. fast/no-docs mode) — `_GenerationRun` still needs the full graph for
+`extract_call_graph`/`extract_heritage` per file, so `release_graph()` itself isn't
+safe to call here.
+
+**Fix:** added `GraphBuilder.release_subgraph_caches()` — a thin public wrapper around
+the existing (private) `_invalidate_subgraph_caches()` — and call it from
+`_GenerationRun.__init__` right after the five metric dicts are snapshotted. If
+anything calls a metric method again later, the subgraphs are simply rebuilt from the
+still-live full graph.
+
+### 7. Ruled out this round
+
+- **Dead code / health findings** (`analysis/dead_code/models.py`,
+  `analysis/health/models.py`) store line numbers/ranges and small metadata dicts, not
+  source text per finding — not a meaningful contributor at 10,788 / 4,211 / 4,938 /
+  ~322,948-line counts.
+- **Double-copying `PipelineResult` data between phases** — `parsed_files`,
+  `source_map`, `graph_builder`, `dead_code_report`, etc. are passed by reference from
+  ingestion through generation and into persistence (`pipeline/orchestrator.py`,
+  `pipeline/phases/generation.py`, `pipeline/persist.py`). One live copy, not two — the
+  actual risk is that this one copy stays alive through persistence too (see below),
+  not that it's duplicated.
+- **Process lifecycle** — for `repowise init` run from the CLI, the command runs to
+  completion in a single short-lived process with engines/connections explicitly
+  disposed before it returns (`init_cmd/command.py`, `_generation_persist.py`,
+  `init_cmd/persistence.py`); the process then exits and the OS reclaims everything, so
+  the "not freed" observation is the transient peak during the run, not a still-running
+  process. (Caveat: if the same `run_pipeline()`/`persist_pipeline_result()` path is
+  ever triggered through `packages/server`'s long-lived job executor instead of the
+  CLI, that peak would sit in a still-running interpreter instead — a materially
+  different risk profile worth keeping in mind if this workload moves there.)
+
+### Updated ranking
+
+| # | Issue | Confidence | Fix risk | Status |
+|---|---|---|---|---|
+| 1 | `file_page_contexts` never cleared | High | Low | Fixed |
+| 5 | Un-batched graph/symbol ORM upserts (single flush of 140k+/254k+/115k+ rows) | High | Low | Fixed |
+| 6 | `GraphBuilder` file/symbol subgraph copies retained through generation | High | Low | Fixed |
+| 2 | `all_pages` held for finalize + persistence | Certain, but architectural | High (out of scope) | Deferred |
+| 4a | `upsert_pages_from_generated` peak | Medium (future phase) | Low-medium | Deferred |
+| 4b | Unbounded queue | Low | Medium | Deferred |
+
+## Resolution (follow-up)
+
+- `persistence/crud/graph.py`: pass `batch_size=_BATCH_SIZE` in
+  `batch_upsert_graph_nodes`, `batch_upsert_graph_edges`, `batch_upsert_graph_metrics`,
+  `batch_upsert_graph_node_membership`.
+- `persistence/crud/external_systems.py`: import `_BATCH_SIZE` and pass it in
+  `batch_upsert_symbols`.
+- `ingestion/graph/builder.py`: added `GraphBuilder.release_subgraph_caches()`.
+- `generation/page_generator/orchestrate.py`: call `graph_builder.release_subgraph_caches()`
+  in `_GenerationRun.__init__` right after the metric dicts are snapshotted.
+
+Issue #2 remains out of scope for the same reason as before (architectural rework of
+the finalize passes), and now additionally spans into persistence, since the same
+`all_pages`/`PipelineResult` data stays live through both. #4a/#4b are unchanged from
+the original pass.
