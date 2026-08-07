@@ -1,7 +1,7 @@
 # Language Support
 
-repowise parses **19 languages to a full AST**, resolves imports and call
-graphs across them, and scores **14 at the Full tier** with code-health markers.
+repowise parses **17 languages to a full AST**, resolves imports and call
+graphs across them, and scores **12 at the Full tier** with code-health markers.
 Everything else in your repo is still tracked through git history and appears in
 the wiki. This page is the "what works for my language today" reference.
 
@@ -20,6 +20,7 @@ produce meaningful output.
 | Tier | Languages | What works |
 |------|-----------|------------|
 | **Full** | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby · VB.NET⁴ | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
+| **Full** | Python · TypeScript · JavaScript · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby · VB.NET³ | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
 | **Good** | C · Swift · PHP · Dart | Everything above except code-health markers (C, Swift, PHP; Dart *does* get health markers). Dedicated workspace resolvers and framework edges per language |
 | **SQL / dbt** | `.sql` via sqlglot | Tables / views / functions / procedures as symbols with wiki pages; dbt projects get real `ref()` / `source()` lineage |
 | **Shell** | `.sh` `.bash` `.zsh` | Function definitions as symbols, `source` / `.` import edges (incl. `$SCRIPT_DIR` / `dirname` / `$BATS_ROOT` idioms), and function-level code-health complexity (CCN, nesting, cognitive). No class metrics, heritage, bindings, or dead-code flagging |
@@ -51,7 +52,7 @@ once it clears the health checklist.
 Lightweight language except HTML, which uses the `tree-sitter-html` grammar.
 Dead-code detection covers the Lightweight tier except HTML, which is never
 flagged (see below).
-⁴ VB.NET is the one Full-tier language whose AST does not come from
+³ VB.NET is the one Full-tier language whose AST does not come from
 tree-sitter — there is no maintained grammar for it, so a Roslyn
 (`Microsoft.CodeAnalysis.VisualBasic`) sidecar process parses it instead.
 Requires the **.NET SDK 8.0+** on the machine running `init`/`update` (only
@@ -436,7 +437,6 @@ where a dialect isn't wired yet. Per-marker mechanics and precision hazards:
 | F# | Good | Lightweight tier shipped; AST upgrade planned (`tree-sitter-f-sharp` available) |
 | SQL / dbt | - | DDL symbols, dbt lineage, app-to-database contracts, health markers shipped. Next: column-level blast radius |
 | Shell | - | Function symbols, `source` import edges, function-level complexity shipped. Next: shebang-based detection of extensionless executables (a traverser capability) |
-| HTML | Lightweight | Shipped: `<script src>` / `<link href>` edges with document-, `public/`- and root-relative resolution; never dead-code flagged. Stays import-tier — HTML has no symbols. Next: a regex import tier for template dialects (Django/Jinja, Go templates, ERB, Handlebars), gated on a framework manifest |
 | VB.NET | Full (health) | Shipped: Roslyn-sidecar AST (symbols/imports/calls/heritage), project awareness, `Handles`/`AddHandler`/WebForms dynamic hints, complexity + starter perf/error-handling markers. Next: validate LCOM4 approximation against a real codebase; dataflow dialect for Extract Method / cross-function perf |
 
 ---
