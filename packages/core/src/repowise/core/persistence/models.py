@@ -1108,7 +1108,7 @@ class HealthFinding(Base):
     file_path: Mapped[str] = mapped_column(Text, nullable=False)
     biomarker_type: Mapped[str] = mapped_column(String(64), nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
-    function_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    function_name: Mapped[str | None] = mapped_column(Text, nullable=True)
     line_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
     line_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
     details_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
