@@ -418,7 +418,6 @@ def _sibling_coverage(file_path: str, governing: list[dict], all_decisions: list
 
     for d in all_decisions:
         affected = json.loads(d.affected_files_json)
-        json.loads(d.affected_modules_json)
         for af in affected:
             af_dir = "/".join(af.split("/")[:-1])
             if af_dir == dir_path and af != file_path:
@@ -525,6 +524,31 @@ def _compute_alignment(
 # Excluded files are skipped at ingest time, but rows may predate an
 # exclude_patterns change, so MCP tools filter their results at query time too.
 # ---------------------------------------------------------------------------
+
+
+def read_repo_file_text(repo_root: Path | str | None, file_path: str) -> str | None:
+    """Read a repo-relative file's live text, or None when it cannot be served.
+
+    Refuses any path that resolves outside *repo_root*: several tools serve
+    live bytes for a path that came out of the index, and an index row is not
+    a trust boundary. Decoding is lossy on purpose (``errors="replace"``): a
+    card describing a latin-1 file should degrade to mojibake in one field,
+    rather than failing the whole call.
+
+    Several tool modules still carry their own near-identical copy of this,
+    each with one extra behaviour bolted on (a size ceiling, lines instead of
+    text). Those are left alone here rather than churned, but new callers
+    belong on this one, and a copy that needs a variation should wrap it.
+    """
+    if repo_root is None:
+        return None
+    try:
+        root = Path(str(repo_root))
+        abs_path = (root / file_path).resolve()
+        abs_path.relative_to(root.resolve())
+        return abs_path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
 
 
 def _get_exclude_spec(repo_path: Path | str) -> Any:

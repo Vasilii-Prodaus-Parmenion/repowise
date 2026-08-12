@@ -81,13 +81,20 @@ async def get_git_metadata_bulk(
     """Return a dict of file_path → GitMetadata for the given paths."""
     if not file_paths:
         return {}
-    result = await session.execute(
-        select(GitMetadata).where(
-            GitMetadata.repository_id == repository_id,
-            GitMetadata.file_path.in_(file_paths),
+    # Batched to stay under SQLite parameter limits (999 on SQLite < 3.32);
+    # callers pass unbounded path sets.
+    out: dict[str, GitMetadata] = {}
+    unique_paths = list(dict.fromkeys(file_paths))
+    for i in range(0, len(unique_paths), _BATCH_SIZE):
+        result = await session.execute(
+            select(GitMetadata).where(
+                GitMetadata.repository_id == repository_id,
+                GitMetadata.file_path.in_(unique_paths[i : i + _BATCH_SIZE]),
+            )
         )
-    )
-    return {gm.file_path: gm for gm in result.scalars().all()}
+        for gm in result.scalars().all():
+            out[gm.file_path] = gm
+    return out
 
 
 async def get_all_git_metadata(session: AsyncSession, repository_id: str) -> dict[str, GitMetadata]:
@@ -96,6 +103,45 @@ async def get_all_git_metadata(session: AsyncSession, repository_id: str) -> dic
         select(GitMetadata).where(GitMetadata.repository_id == repository_id)
     )
     return {gm.file_path: gm for gm in result.scalars().all()}
+
+
+#: The only git fields dead-code confidence is scored from
+#: (``analyzer._make_unreachable_finding`` and its sibling detectors).
+_DEAD_CODE_GIT_FIELDS = (
+    "commit_count_90d",
+    "last_commit_at",
+    "age_days",
+    "primary_owner_name",
+)
+
+
+async def get_dead_code_git_fields(session: AsyncSession, repository_id: str) -> dict[str, dict]:
+    """Return ``{file_path: {field: value}}`` for the dead-code scoring fields.
+
+    The incremental update path re-indexes git metadata for the *changed* files
+    only, so the dead-code analyzer otherwise sees an empty dict for every
+    unchanged file — which lands each one on the ``commit_count_90d == 0``
+    branch of the confidence ladder (0.7, ``safe_to_delete=True``) however
+    actively the file is committed to. This supplies the stored value instead.
+
+    Deliberately four narrow columns rather than ``get_all_git_metadata``'s
+    whole ORM rows: this runs on every update over every file in the repo, and
+    hydrating 60k full rows to read four fields is the cost that was just taken
+    out of ``backfill_related_pages``.
+
+    The values are one update-interval stale for idle files, whose time-decayed
+    windows are rewritten later in the same run, after analysis. That is
+    strictly closer to the truth than the empty dict it replaces.
+    """
+    rows = (
+        await session.execute(
+            select(
+                GitMetadata.file_path,
+                *(getattr(GitMetadata, f) for f in _DEAD_CODE_GIT_FIELDS),
+            ).where(GitMetadata.repository_id == repository_id)
+        )
+    ).all()
+    return {r[0]: dict(zip(_DEAD_CODE_GIT_FIELDS, r[1:], strict=True)) for r in rows}
 
 
 # Repo-wide-walk signals (co-change pairs, Hassan entropy). A pass that did

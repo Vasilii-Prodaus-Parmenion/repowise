@@ -8,6 +8,25 @@ from repowise.cli.helpers import (
     console,
     resolve_command_target,
 )
+from repowise.cli.output import (
+    emit_json,
+    format_option,
+    json_option,
+    notice_console,
+    resolve_format,
+)
+
+#: Every ``hook stats --format json`` payload carries these five keys, whether
+#: or not there is a ledger to fill them from. A consumer that has to check
+#: which keys exist before reading them is not much better off than one parsing
+#: a table, so the empty case is the full shape rather than a shorter one.
+_EMPTY_STATS: dict = {
+    "surfaces": [],
+    "runs": [],  # hook_run_by_tool
+    "decision_feedback": {},  # decision_feedback_totals
+    "builds": [],  # injection_builds
+    "rewrite": [],  # rewrite_run_totals
+}
 
 
 @click.group("hook")
@@ -126,6 +145,32 @@ def _target_repo_paths(target) -> list:
         ]
     assert target.repo_path is not None
     return [target.repo_path] if (target.repo_path / ".repowise").is_dir() else []
+
+
+def _print_rewrite_hook_status(label: str, status) -> None:
+    """Report one agent's rewrite hook, separating registered from live.
+
+    Presence keys on the hook command, so an entry whose matcher names a tool
+    the agent has since renamed reads as "installed" while firing on nothing.
+    A hook that matches nothing is silent in exactly the way a working one is,
+    which is why this has to be said rather than inferred.
+    """
+    if not status.installed:
+        console.print(f"  [dim]✗[/dim] {label} rewrite hook: not installed")
+        return
+    if not status.unmatched:
+        console.print(f"  [green]✓[/green] {label} rewrite hook: installed")
+        return
+    missed = ", ".join(status.unmatched)
+    state = "registered but inert" if not status.fires else "installed, matcher too narrow"
+    console.print(f"  [yellow]![/yellow] {label} rewrite hook: {state}")
+    console.print(
+        f"      [dim]its matcher ({status.matcher!r}) does not select {missed}, so "
+        f"commands {label} runs under {'that name' if len(status.unmatched) == 1 else 'those names'} "
+        "pass through unrewritten. `repowise hook rewrite install` repoints a "
+        "matcher it recognises as its own; a hand-narrowed one has to be "
+        "widened by hand.[/dim]"
+    )
 
 
 def _codex_capability_note(version, supports) -> str:
@@ -341,11 +386,7 @@ def rewrite_status(path: str | None, workspace: bool, no_workspace: bool) -> Non
     from repowise.cli.agent_adapters.claude_code import ClaudeCodeAdapter
     from repowise.cli.agent_adapters.codex import CodexAdapter
 
-    installed = ClaudeCodeAdapter().rewrite_hook_installed()
-    icon = "[green]✓[/green]" if installed else "[dim]✗[/dim]"
-    console.print(
-        f"  {icon} claude-code rewrite hook: {'installed' if installed else 'not installed'}"
-    )
+    _print_rewrite_hook_status("claude-code", ClaudeCodeAdapter().rewrite_hook_status())
 
     codex = CodexAdapter()
     if not codex.detect():
@@ -360,11 +401,7 @@ def rewrite_status(path: str | None, workspace: bool, no_workspace: bool) -> Non
 
     version = codex_cli_version()
     supports = codex_supports_rewrite(version)
-    codex_installed = codex.rewrite_hook_installed()
-    icon = "[green]✓[/green]" if codex_installed else "[dim]✗[/dim]"
-    console.print(
-        f"  {icon} codex rewrite hook: {'installed' if codex_installed else 'not installed'}"
-    )
+    _print_rewrite_hook_status("codex", codex.rewrite_hook_status())
     console.print(f"      [dim]{_codex_capability_note(version, supports)}[/dim]")
 
     target = _hook_target(path, workspace, no_workspace)
@@ -465,6 +502,68 @@ def read_skeleton_status(path: str | None, workspace: bool, no_workspace: bool) 
             )
 
 
+@hook_group.group("read-reread")
+def read_reread_group() -> None:
+    """Manage collapsed re-reads (Claude Code).
+
+    Reading a file the session has already read, with no edit in between and
+    the bytes unchanged, returns a short notice naming the earlier read
+    instead of the content — which is already a few tool calls up in context.
+
+    Nothing is guessed: the served bytes are hashed, and a file whose content
+    differs is served in full, with a line saying it changed underneath you.
+    Reading again always returns the content, so a compaction that dropped the
+    earlier copy costs one extra Read and nothing else.
+
+    Like `read-skeleton`, there is no hook to install. This moves the per-repo
+    verdict `hooks.read_reread`.
+    """
+
+
+@read_reread_group.command("install")
+@click.argument("path", required=False, default=None)
+@click.option("--workspace", "-w", is_flag=True, default=False, help="Force workspace mode.")
+@click.option("--no-workspace", is_flag=True, default=False, help="Force single-repo mode.")
+def read_reread_install(path: str | None, workspace: bool, no_workspace: bool) -> None:
+    """Collapse unchanged re-reads to a notice in this repo."""
+    _set_hook_surface(
+        path, workspace, no_workspace,
+        surface="read_reread", label="Collapsed re-reads", enabled=True,
+    )
+
+
+@read_reread_group.command("uninstall")
+@click.argument("path", required=False, default=None)
+@click.option("--workspace", "-w", is_flag=True, default=False, help="Force workspace mode.")
+@click.option("--no-workspace", is_flag=True, default=False, help="Force single-repo mode.")
+def read_reread_uninstall(path: str | None, workspace: bool, no_workspace: bool) -> None:
+    """Stop collapsing re-reads in this repo; they come back whole."""
+    _set_hook_surface(
+        path, workspace, no_workspace,
+        surface="read_reread", label="Collapsed re-reads", enabled=False,
+    )
+
+
+@read_reread_group.command("status")
+@click.argument("path", required=False, default=None)
+@click.option("--workspace", "-w", is_flag=True, default=False, help="Force workspace mode.")
+@click.option("--no-workspace", is_flag=True, default=False, help="Force single-repo mode.")
+def read_reread_status(path: str | None, workspace: bool, no_workspace: bool) -> None:
+    """Report whether unchanged re-reads are being collapsed."""
+    from repowise.cli.commands.augment_cmd.reread import enabled as reread_enabled
+
+    target = _hook_target(path, workspace, no_workspace)
+    for repo_path in _target_repo_paths(target):
+        on = reread_enabled(repo_path)
+        icon = "[green]✓[/green]" if on else "[dim]✗[/dim]"
+        console.print(f"  {icon} collapsed re-reads: {'on' if on else 'off'} ({repo_path})")
+        if not on:
+            console.print(
+                "      [dim]`repowise saved` shows what this would have saved "
+                "if it were on.[/dim]"
+            )
+
+
 @hook_group.group("search-digest")
 def search_digest_group() -> None:
     """Manage digest-served searches (Claude Code).
@@ -527,16 +626,87 @@ def search_digest_status(path: str | None, workspace: bool, no_workspace: bool) 
             )
 
 
+def _print_rewrite(rows: list[dict]) -> None:
+    """The PreToolUse rewrite hook's own table: what it wrapped and what it let by.
+
+    Its own block rather than a row in the efficacy table above, because the
+    two measure different things and the columns do not transfer. An emission
+    surface is judged on whether the agent acted; this one either rewrote a
+    command or did not, and the interesting number is the reason it did not.
+    """
+    if not rows:
+        return
+    from rich.table import Table
+
+    from repowise.cli.hook_ledger import REWRITTEN
+
+    rewritten = sum(r["calls"] for r in rows if r["outcome"] == REWRITTEN)
+    total = sum(r["calls"] for r in rows)
+    table = Table(title="Command rewrite hook (PreToolUse)", header_style="bold")
+    table.add_column("outcome/reason")
+    table.add_column("commands", justify="right")
+    table.add_column("share", justify="right")
+    table.add_column("sessions", justify="right")
+    table.add_column("median ms", justify="right")
+    for row in rows:
+        share = 100.0 * row["calls"] / total if total else 0.0
+        colour = "green" if row["outcome"] == REWRITTEN else "dim"
+        per_call = row["total_ms"] // row["calls"] if row["calls"] else 0
+        table.add_row(
+            f"[{colour}]{row['outcome']}/{row['reason']}[/{colour}]",
+            f"{row['calls']:,}",
+            f"{share:.1f}%",
+            f"{row['sessions']:,}",
+            str(per_call),
+        )
+    console.print(table)
+    pct = 100.0 * rewritten / total if total else 0.0
+    console.print(
+        f"  [dim]{rewritten:,} of {total:,} shell commands rewritten ({pct:.1f}%). "
+        "Commands run outside an indexed repo are not counted — there is no "
+        "ledger there to count them in.[/dim]"
+    )
+
+
+def _print_builds(builds: list[dict]) -> None:
+    """Name the builds behind these firings; loud when there is more than one.
+
+    A ledger with two live builds in it is not a curiosity: an emitter deleted
+    in one install can still be firing from the other, and from a transcript
+    alone that is indistinguishable from a retirement that never happened. One
+    build is a one-line footnote; two is a warning, and the rows above cannot
+    be read as one population until it is resolved.
+    """
+    if not builds:
+        return
+    stamped = [b for b in builds if b["build"]]
+    unstamped = next((b for b in builds if not b["build"]), None)
+    if unstamped is not None:
+        console.print(
+            f"  [dim]{unstamped['firings']:,} firings predate build stamping and "
+            "cannot be attributed to an install.[/dim]"
+        )
+    if not stamped:
+        return
+    if len(stamped) == 1:
+        console.print(f"  [dim]emitted by build {stamped[0]['build']}.[/dim]")
+        return
+    console.print(
+        f"  [yellow]{len(stamped)} builds emitted into this ledger[/yellow] — the rows "
+        "above are not one population:"
+    )
+    for row in stamped:
+        console.print(
+            f"    [dim]{row['build']}: {row['firings']:,} firings across "
+            f"{row['sessions']:,} sessions[/dim]"
+        )
+
+
 @hook_group.command("stats")
 @click.argument("path", required=False, default=None)
-@click.option(
-    "--json",
-    "as_json",
-    is_flag=True,
-    default=False,
-    help="Emit the raw per-surface rows as JSON instead of a table.",
-)
-def hook_stats(path: str | None, as_json: bool) -> None:
+@format_option(help="Output format. ``json`` emits the raw per-surface rows.")
+@json_option()
+def hook_stats(path: str | None, fmt: str, as_json: bool) -> None:
     """Show what the agent hooks fired and whether the agent acted on it.
 
     Reads the efficacy ledger in .repowise/sessions/sessions.db. The live
@@ -545,15 +715,22 @@ def hook_stats(path: str | None, as_json: bool) -> None:
     acted on. A surface showing firings but no verdicts has not been
     classified yet — run the backfill.
     """
-    import json as json_mod
-
-    from repowise.core.sessions.efficacy import CLASSIFIED_SURFACES, NO_ACTION_EXPECTED
+    from repowise.core.sessions.efficacy import (
+        CLASSIFIED_SURFACES,
+        NO_ACTION_EXPECTED,
+        RETIRED_CATEGORIES,
+    )
     from repowise.core.sessions.staging import SessionStagingStore, default_store_path
+
+    fmt = resolve_format(fmt, as_json)
+    notices = notice_console(fmt)
 
     target = resolve_command_target(path=path, workspace_flag=False, no_workspace_flag=True)
     assert target.repo_path is not None
     if not default_store_path(target.repo_path).exists():
-        console.print("[yellow]No hook ledger yet.[/yellow] Run `repowise hook backfill`.")
+        notices.print("[yellow]No hook ledger yet.[/yellow] Run `repowise hook backfill`.")
+        if fmt == "json":
+            emit_json(_EMPTY_STATS)
         return
 
     store = SessionStagingStore.open_default(target.repo_path)
@@ -562,14 +739,39 @@ def hook_stats(path: str | None, as_json: bool) -> None:
         session_totals = store.session_duration_totals()
         runs = store.hook_run_totals()
         by_tool = store.hook_run_by_tool()
+        feedback = store.decision_feedback_totals()
+        builds = store.injection_builds()
+        rewrites = store.rewrite_run_totals()
     finally:
         store.close()
     if not rows:
-        console.print("[yellow]Hook ledger is empty.[/yellow] Run `repowise hook backfill`.")
+        notices.print("[yellow]Hook ledger is empty.[/yellow] Run `repowise hook backfill`.")
+        if fmt == "json":
+            emit_json(
+                {
+                    **_EMPTY_STATS,
+                    "runs": by_tool,
+                    "decision_feedback": feedback,
+                    "builds": builds,
+                    "rewrite": rewrites,
+                }
+            )
         return
 
-    if as_json:
-        console.print_json(json_mod.dumps({"surfaces": rows, "runs": by_tool}))
+    if fmt == "json":
+        # The machine-readable twin carries the same lie the table did, so it
+        # gets the same label rather than a footer nothing can parse.
+        for row in rows:
+            row["retired"] = (row["surface"], row["category"]) in RETIRED_CATEGORIES
+        emit_json(
+            {
+                "surfaces": rows,
+                "runs": by_tool,
+                "decision_feedback": feedback,
+                "builds": builds,
+                "rewrite": rewrites,
+            }
+        )
         return
 
     from rich.table import Table
@@ -586,7 +788,13 @@ def hook_stats(path: str | None, as_json: bool) -> None:
     for row in rows:
         pair = (row["surface"], row["category"])
         classified = row["evaluated"]
-        if row["surface"] not in CLASSIFIED_SURFACES:
+        retired = pair in RETIRED_CATEGORIES
+        if retired:
+            # A closed population. Its firings and cost are real history and
+            # stay visible; its rate is not a rate, because the denominator
+            # stopped growing when the emission was deleted.
+            acted, rate = "-", "[dim]retired[/dim]"
+        elif row["surface"] not in CLASSIFIED_SURFACES:
             # Decision rows are judged as followed-vs-contradicted against the
             # decision records, not as acted-on; read_enrich never emits.
             acted, rate = "-", "[dim]n/a[/dim]"
@@ -600,20 +808,54 @@ def hook_stats(path: str | None, as_json: bool) -> None:
             colour = "green" if pct >= 20 else ("yellow" if pct >= 5 else "red")
             rate = f"[{colour}]{pct:.1f}%[/{colour}]"
         n = row["duration_ms_count"]
+        # Dimming the whole row is what makes a retired surface legible at a
+        # glance; the rate cell alone is too easy to read past.
+        lo, hi = ("[dim]", "[/dim]") if retired else ("", "")
+        label = f"{row['surface']}/{row['category']}" if row["category"] else row["surface"]
         table.add_row(
-            f"{row['surface']}/{row['category']}" if row["category"] else row["surface"],
-            str(row["firings"]),
-            str(row["sessions"]),
-            acted,
+            f"{lo}{label}{hi}",
+            f"{lo}{row['firings']}{hi}",
+            f"{lo}{row['sessions']}{hi}",
+            acted if acted == "-" else f"{lo}{acted}{hi}",
             rate,
-            f"~{row['chars'] // 4}t",
-            f"{row['duration_ms_total'] // n}" if n else "[dim]-[/dim]",
+            f"{lo}~{row['chars'] // 4}t{hi}",
+            f"{lo}{row['duration_ms_total'] // n}{hi}" if n else "[dim]-[/dim]",
         )
     console.print(table)
     console.print(
-        "  [dim]rate is over classified firings only; 'n/a' marks a notice with no "
-        "action to take, and read/reread counts as respected-not-re-offended.[/dim]"
+        "  [dim]rate is over classified firings only, and 'n/a' marks a notice "
+        "with no action to take. Dimmed 'retired' rows are history: the "
+        "emission is gone, so the counts cannot grow and the rate is not "
+        "adoption.[/dim]"
     )
+
+    _print_rewrite(rewrites)
+    _print_builds(builds)
+
+    # The decision surface's own verdict, which the acted-on rate above cannot
+    # carry: an injected decision is judged by whether the session went on to
+    # contradict it, not by whether a tool call followed it.
+    if any(feedback.values()):
+        judged = feedback["followed"] + feedback["contradicted"]
+        parts = [
+            f"[green]{feedback['followed']} followed[/green]",
+            f"[yellow]{feedback['contradicted']} contradicted[/yellow]",
+        ]
+        if feedback["pending"]:
+            parts.append(f"[dim]{feedback['pending']} awaiting the next update[/dim]")
+        if feedback["no_verdict"]:
+            parts.append(
+                f"[dim]{feedback['no_verdict']} unjudged, mostly for want of "
+                "anything to judge them against[/dim]"
+            )
+        console.print(f"  injected decisions: {', '.join(parts)}")
+        if judged:
+            pct = 100.0 * feedback["followed"] / judged
+            console.print(
+                f"  [dim]{pct:.0f}% of judged injections were followed. Judged means the "
+                "session mined a correction that could have disagreed; the rest are "
+                "counted nowhere.[/dim]"
+            )
 
     if session_totals:
         session_totals.sort()
@@ -678,9 +920,10 @@ def hook_stats(path: str | None, as_json: bool) -> None:
     is_flag=True,
     default=False,
     help=(
-        "Clear the read/search/fix_history rows before replaying. Run this once "
-        "after upgrading: rows written under the older ledger keys cannot be "
-        "matched to a transcript firing and would be counted twice."
+        "Clear every transcript-classified surface's rows before replaying. "
+        "Run this once after upgrading: rows written under the older ledger "
+        "keys cannot be matched to a transcript firing and would be counted "
+        "twice. Decision rows are never touched."
     ),
 )
 def hook_backfill(path: str | None, all_projects: bool, days: int | None, reset: bool) -> None:

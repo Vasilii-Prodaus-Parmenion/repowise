@@ -13,6 +13,7 @@ from repowise.core.persistence.models import (
     GitMetadata,
     Page,
 )
+from repowise.core.providers.embedding import store_has_semantic_vectors
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.core.test_paths import is_test_path, is_test_related_path
 from repowise.server.mcp_server._answer_pipeline import _RRF_K, _RRF_SCORE_SCALE
@@ -273,11 +274,13 @@ async def _non_decision_fallback(ctx, query: str, fetch_limit: int) -> list[dict
     """
     results = []
     src = "vector"
-    with contextlib.suppress(TimeoutError, Exception):
-        results = await asyncio.wait_for(
-            ctx.vector_store.search(query, limit=fetch_limit * 4),
-            timeout=8.0,
-        )
+    # Skipped on a keyless index, which then falls through to the FTS branch.
+    if store_has_semantic_vectors(ctx.vector_store):
+        with contextlib.suppress(TimeoutError, Exception):
+            results = await asyncio.wait_for(
+                ctx.vector_store.search(query, limit=fetch_limit * 4),
+                timeout=8.0,
+            )
     if not results:
         src = "fts"
         with contextlib.suppress(Exception):
@@ -483,6 +486,33 @@ def _attach_paths(output: list[dict], page_info: dict) -> None:
             item["file"] = item["target_path"].split("::", 1)[0]
 
 
+def _drop_derivable_page_ids(results: list[dict]) -> list[dict]:
+    """Strip ``page_id`` from every result that can rebuild it, in place.
+
+    A page id is ``compute_page_id(page_type, target_path)`` — literally
+    ``f"{page_type}:{target_path}"`` (``core/generation/models.py``) — and both
+    halves ship in the same row. So the field is 229-369 characters per
+    response, 7.8-10.3% of the payload, restating two of its own siblings. It
+    is ranking plumbing: every internal use above keys the fused dict on it,
+    and none of that needs to reach the wire.
+
+    Conditional rather than unconditional, and the condition is the derivation
+    itself. ``_attach_paths`` writes ``target_path: ""`` for a hit whose Page
+    row did not load, and a row like that cannot be rebuilt — so it keeps its
+    id instead of losing one. The rule is "drop it only where it is provably
+    redundant", which is also the check: if this ever stops firing, the
+    invariant it rests on has changed.
+
+    Consumers rebuild with the same expression; ``ui/src/chat/source-citations``
+    does exactly that, and used to skip any row whose ``page_id`` was missing.
+    """
+    for item in results:
+        derived = f"{item.get('page_type', '')}:{item.get('target_path', '')}"
+        if item.get("page_id") == derived:
+            item.pop("page_id", None)
+    return results
+
+
 async def _load_page_info(
     session, output: list[dict], *, with_git: bool = False
 ) -> tuple[dict, set, dict]:
@@ -565,8 +595,13 @@ async def _safe_vector(ctx, query: str, limit: int) -> list:
 
     Readiness is awaited by the caller (``_wait_for_vector_store``) before the
     fused retrieve runs, so this path does not re-wait.
+
+    Returns nothing on a keyless index. ``store_has_semantic_vectors`` explains
+    why the mock's vectors cannot be ranked on; the reason this is enforced here
+    rather than in ``_fused_retrieve`` is that this function is the only place
+    the vector leg is entered, so a later caller inherits the guard.
     """
-    if ctx.vector_store is None:
+    if ctx.vector_store is None or not store_has_semantic_vectors(ctx.vector_store):
         return []
     with contextlib.suppress(Exception):
         return await asyncio.wait_for(ctx.vector_store.search(query, limit=limit), timeout=8.0)
@@ -704,6 +739,8 @@ async def _federated_search(
     # name files.
     if candidates := file_candidates(all_results, limit=limit):
         response["candidates"] = candidates
+    # Last, so nothing above has to know the field is on its way out.
+    _drop_derivable_page_ids(output)
     return response
 
 
@@ -882,8 +919,14 @@ async def _structured_search(
     # hybrid modes the ranked pool leads with symbol hits, and those are the
     # entries most likely to collapse onto one another (several symbols of one
     # file). Deduping them is the point.
-    if candidates := file_candidates(results, limit=limit):
-        response["candidates"] = candidates
+    #
+    # Bound to its own name, NOT to ``candidates``: that one holds the query's
+    # identifiers, which the exact-match note below quotes. Rebinding it here
+    # made the note quote file paths as if they were the identifiers asked for,
+    # and — worse — made its gate true for any query with results at all, so a
+    # prose query that names no identifier was told no symbol matched it.
+    if file_cands := file_candidates(results, limit=limit):
+        response["candidates"] = file_cands
     # Exact-match honesty: an identifier-shaped query whose target names no
     # indexed symbol still returns fuzzy neighbours. Say so, or the agent
     # anchors on a wrong hit that looks authoritative (their Alamofire
@@ -903,6 +946,8 @@ async def _structured_search(
             )
     if grep_hint and not results:
         response["grep_hint"] = grep_hint
+    # Last, so nothing above has to know the field is on its way out.
+    _drop_derivable_page_ids(results)
     return response
 
 
@@ -920,10 +965,10 @@ async def search_codebase(
 
     For QUESTIONS ("how does X work", "where is Y handled", "why is Z like
     this"), call get_answer instead: it runs this same hybrid retrieval
-    internally and synthesizes a cited answer, so a search_codebase call
-    before get_answer is a wasted round-trip. Use this tool directly when you
-    want the raw ranked hits themselves — enumerating matches, resolving an
-    identifier to a symbol_id, or scoping a later get_context call.
+    internally and synthesizes a cited answer, so searching first is a wasted
+    round-trip. Use this tool when you want the raw ranked hits themselves —
+    enumerating matches, resolving an identifier to a symbol_id, or scoping a
+    later get_context call.
 
     mode="auto" (default) routes the query: identifier-shaped queries search
     the indexed symbols (returns symbol_id/file/line bounds — pipe into
@@ -1030,4 +1075,6 @@ async def search_codebase(
         response["candidates"] = candidates
     if grep_hint and not output:
         response["grep_hint"] = grep_hint
+    # Last, so nothing above has to know the field is on its way out.
+    _drop_derivable_page_ids(output)
     return response

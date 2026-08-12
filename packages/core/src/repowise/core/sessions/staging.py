@@ -41,6 +41,12 @@ SESSIONS_DB_FILENAME = "sessions.db"
 #: backlog would grow the batched LLM pass forever.
 RAW_TTL_DAYS = 90.0
 
+#: ``PRAGMA user_version`` marking that :meth:`retire_unjudgeable_verdicts`
+#: has run on this store. A one-shot data repair, not a schema migration, so
+#: it rides the pragma rather than a table: the hook path opens this same
+#: database with raw sqlite3 and must not learn about a new one.
+_VERDICT_REPAIR_VERSION = 1
+
 #: Cap on the distinct session ids tracked per structured decision. Two is
 #: enough to promote; beyond a handful the extra ids only pad evidence.
 _MAX_SESSIONS_TRACKED = 20
@@ -93,6 +99,8 @@ CREATE TABLE IF NOT EXISTS injections (
     chars INTEGER NOT NULL DEFAULT 0,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     acted INTEGER NOT NULL DEFAULT 0,
+    verdict TEXT NOT NULL DEFAULT '',
+    build TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (session_id, decision_id)
 );
 CREATE INDEX IF NOT EXISTS idx_raw_pending ON raw_candidates(structured_key)
@@ -111,6 +119,15 @@ INJECTIONS_LEDGER_COLUMNS = (
     # :mod:`repowise.core.sessions.efficacy` for how both are filled in.
     ("duration_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("acted", "INTEGER NOT NULL DEFAULT 0"),
+    # How a decision injection was judged: 'followed' | 'contradicted', or ''
+    # for a row judged on some other surface, not yet judged, or evaluated
+    # before this column existed. See :meth:`decision_feedback_totals`.
+    ("verdict", "TEXT NOT NULL DEFAULT ''"),
+    # Which repowise build emitted the row ("<version>+<install digest>"); see
+    # ``repowise.cli.hook_ledger.emitting_build``. Empty on every row written
+    # before this column existed, and that emptiness is the point: those are
+    # exactly the rows whose attribution cannot be recovered.
+    ("build", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -503,6 +520,50 @@ class SessionStagingStore:
             for r in rows
         ]
 
+    def rewrite_run_totals(self) -> list[dict[str, Any]]:
+        """What the PreToolUse rewrite hook did, per outcome and reason.
+
+        The rewrite hook's only instrument. An ``updatedInput`` rewrite never
+        appears in a transcript and neither does a passthrough, so before these
+        rows the busiest hook surface reported nothing at all and its bail
+        distribution was inference.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT outcome, reason, SUM(calls), COUNT(DISTINCT session_id), SUM(total_ms) "
+                "FROM rewrite_runs GROUP BY outcome, reason ORDER BY SUM(calls) DESC"
+            ).fetchall()
+        except sqlite3.Error:
+            return []  # sidecar predates the table: no rewrite rows, not an error
+        return [
+            {
+                "outcome": r[0],
+                "reason": r[1],
+                "calls": r[2] or 0,
+                "sessions": r[3] or 0,
+                "total_ms": r[4] or 0,
+            }
+            for r in rows
+        ]
+
+    def injection_builds(self) -> list[dict[str, Any]]:
+        """Which repowise builds emitted the rows in this ledger, busiest first.
+
+        More than one live build here means two installs are emitting into the
+        same repo, and the rows above them are not one population: a surface
+        deleted in one install can still be firing from the other. Rows written
+        before the ``build`` column are grouped under ``""`` and labelled as
+        unattributable rather than folded into whichever build is current.
+        """
+        rows = self._conn.execute(
+            "SELECT build, COUNT(*), COUNT(DISTINCT session_id), MAX(shown_at) "
+            "FROM injections GROUP BY build ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        return [
+            {"build": r[0] or "", "firings": r[1], "sessions": r[2], "last_seen": r[3] or 0.0}
+            for r in rows
+        ]
+
     def session_duration_totals(self) -> list[int]:
         """Total hook wall-time per session, in ms, for sessions that have it."""
         rows = self._conn.execute(
@@ -545,11 +606,87 @@ class SessionStagingStore:
             for r in rows
         ]
 
-    def mark_injection_evaluated(self, session_id: str, decision_id: str) -> None:
+    def mark_injection_evaluated(
+        self, session_id: str, decision_id: str, *, verdict: str = ""
+    ) -> None:
+        """Settle one injection row, recording *verdict* when there is one.
+
+        A row judged with no verdict (the decision record is gone, so there is
+        nothing to judge against) is still marked evaluated so it is not
+        re-examined forever — it just doesn't count towards either side.
+        """
         self._conn.execute(
-            "UPDATE injections SET evaluated = 1 WHERE session_id = ? AND decision_id = ?",
-            (session_id, decision_id),
+            "UPDATE injections SET evaluated = 1, verdict = ? "
+            "WHERE session_id = ? AND decision_id = ?",
+            (verdict, session_id, decision_id),
         )
+
+    def retire_unjudgeable_verdicts(self) -> int:
+        """Drop ``followed`` from rows nothing could have contradicted.
+
+        ``followed`` used to be the else branch of the contradiction test, so
+        every injection into a session with no mined correction earned one for
+        free, and those rows are already ``evaluated`` — the live judgement
+        never reads them again. Without this the reported rate stays pinned at
+        whatever the else branch produced, which on this machine was all 106
+        of them at 100%.
+
+        **Runs exactly once per store**, gated on ``PRAGMA user_version``
+        rather than repeated every pass, and that is not a cost decision. The
+        test it applies — the showing session mined no ``user_correction`` —
+        is only true-forever for rows written under the old rule. Run
+        perpetually it would also retire *earned* verdicts, on two paths: as
+        :data:`RAW_TTL_DAYS` prunes the corrections that justified them, and
+        as a session's only correction turns out to be a repeat of one already
+        staged under another session (see ``SessionCandidate.hash``). Either
+        way a real "followed" would decay to no-verdict and the rate would
+        understate itself a little more each quarter. Returns the number of
+        rows retired, and 0 on a store that has already had it.
+        """
+        if self._conn.execute("PRAGMA user_version").fetchone()[0] >= _VERDICT_REPAIR_VERSION:
+            return 0
+        placeholders = ",".join("?" * len(self.DECISION_SURFACES))
+        cur = self._conn.execute(
+            f"UPDATE injections SET verdict = '' WHERE surface IN ({placeholders}) "
+            "AND verdict = 'followed' AND NOT EXISTS ("
+            "SELECT 1 FROM raw_candidates rc WHERE rc.session_id = injections.session_id "
+            "AND rc.kind = 'user_correction')",
+            self.DECISION_SURFACES,
+        )
+        # PRAGMA takes no parameters, hence the interpolation of an int constant.
+        self._conn.execute(f"PRAGMA user_version = {_VERDICT_REPAIR_VERSION}")
+        return cur.rowcount or 0
+
+    def decision_feedback_totals(self) -> dict[str, int]:
+        """Counts of decision injections by followed-vs-contradicted verdict.
+
+        Covers :data:`DECISION_SURFACES` only — the surfaces whose rows are
+        judged against the decision records rather than by the transcript
+        classifier. ``pending`` is rows awaiting the next update's judgement;
+        ``no_verdict`` is rows already settled without one — most of them
+        injections no session could have disagreed with, because no correction
+        was mined from any session that saw them (see
+        :func:`~repowise.core.sessions.miners.decisions.apply_injection_feedback`),
+        plus a drained orphan (the decision record was gone) or a row judged
+        before this column existed. None of it is recoverable, so all of it is
+        reported rather than quietly folded into one of the two real verdicts,
+        which is exactly how the followed rate came to read 100%.
+        """
+        placeholders = ",".join("?" * len(self.DECISION_SURFACES))
+        rows = self._conn.execute(
+            "SELECT verdict, evaluated, COUNT(*) FROM injections "
+            f"WHERE surface IN ({placeholders}) GROUP BY verdict, evaluated",
+            self.DECISION_SURFACES,
+        ).fetchall()
+        totals = {"followed": 0, "contradicted": 0, "pending": 0, "no_verdict": 0}
+        for verdict, evaluated, count in rows:
+            if verdict in ("followed", "contradicted"):
+                totals[verdict] += count
+            elif evaluated:
+                totals["no_verdict"] += count
+            else:
+                totals["pending"] += count
+        return totals
 
     def correction_quotes(self, session_id: str) -> list[str]:
         """Verbatim user-correction quotes mined from one session's transcript."""

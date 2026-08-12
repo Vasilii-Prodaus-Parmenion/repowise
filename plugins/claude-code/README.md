@@ -39,7 +39,7 @@ MCP tools and skills activate automatically.
 
 Graph (tree-sitter dependency graph, 16 languages) · Git (hotspots, ownership,
 co-change, bus factor) · Docs (LLM-generated wiki + semantic search) · Decisions
-(architectural rationale mined from eight sources) · Code Health (1–10
+(architectural rationale mined from five sources) · Code Health (1–10
 defect-validated score from deterministic markers).
 
 ### Slash commands
@@ -50,13 +50,19 @@ defect-validated score from deterministic markers).
 | `/repowise:status` | Health check — sync state, page counts, provider info |
 | `/repowise:update` | Incremental update — sync the index with recent code changes |
 | `/repowise:search` | Search the codebase wiki (fulltext, semantic, or symbol) |
+| `/repowise:ask` | Cited, synthesised answer to a codebase question (LLM call) |
+| `/repowise:context` | Triage card for files/modules/symbols (layer, hotspot, freshness) |
+| `/repowise:symbol` | Read one symbol body with live-verified line bounds |
 | `/repowise:reindex` | Rebuild the vector store (re-embed; no LLM calls) |
 | `/repowise:health` | Code-health KPIs, lowest-scoring files, refactoring targets, trends |
 | `/repowise:coverage` | Ingest or inspect coverage reports (lights up untested hotspots + per-test map) |
 | `/repowise:impacted-tests` | Tests whose coverage intersects a change (commit / range / staged) |
 | `/repowise:risk` | Defect-risk score for a change (commit or `base..head` range) |
+| `/repowise:security` | Full-history secret scan (`repowise security scan --history`) |
 | `/repowise:dead-code` | Unreachable files, unused exports, zombie packages by confidence |
+| `/repowise:export` | Export wiki pages or a Structurizr architecture model |
 | `/repowise:decision` | List, inspect, add, or confirm architectural decisions |
+| `/repowise:why` | Why the code is shaped this way (decisions + archaeology) |
 | `/repowise:doctor` | Diagnose (and optionally repair) the setup, keys, and index drift |
 
 ### Automatic skills
@@ -109,7 +115,7 @@ The plugin registers two hooks that run `repowise-augment`:
 - **`SessionStart`** (`startup|resume|clear`) — emits live index-freshness /
   trust context at session start.
 - **`PostToolUse`** after
-  `Bash|PowerShell|Grep|Glob|Read|Edit|Write|mcp__.*[Rr]epowise.*__.*` —
+  `Grep|Glob|Read|Edit|Write|mcp__.*[Rr]epowise.*__.*` —
   stays silent unless it has something asymmetric to add (rescuing a
   zero-result grep with the closest indexed symbol, ranking a flood of
   matches by graph centrality, flagging a stale read, or recording

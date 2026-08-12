@@ -20,7 +20,7 @@ from repowise.core.persistence.database import (
 )
 from repowise.core.persistence.search import FullTextSearch
 from repowise.core.persistence.vector_store import InMemoryVectorStore
-from repowise.core.providers.embedding.base import MockEmbedder
+from repowise.core.providers.embedding.base import KeylessEmbedder
 from repowise.server.mcp_server import _state
 
 _log = __import__("logging").getLogger("repowise.mcp")
@@ -195,7 +195,7 @@ def _resolve_embedder():
             "requested": name or None,
             "degraded": False,
         }
-        return MockEmbedder()
+        return KeylessEmbedder()
 
     try:
         embedder = get_embedder(name, **_embedder_kwargs(name))
@@ -219,7 +219,7 @@ def _resolve_embedder():
             "degraded": True,
             "reason": reason,
         }
-        return MockEmbedder()
+        return KeylessEmbedder()
 
 
 async def _cancel_task(task: asyncio.Task) -> None:
@@ -304,7 +304,7 @@ async def _load_vector_stores(repo_path: str | None) -> None:
         _state._decision_store = vector_store
     except Exception:
         _log.exception("Failed to load vector stores — falling back to MockEmbedder")
-        _fallback = InMemoryVectorStore(embedder=MockEmbedder())
+        _fallback = InMemoryVectorStore(embedder=KeylessEmbedder())
         _state._vector_store = _fallback
         _state._decision_store = _fallback
     finally:
@@ -491,7 +491,7 @@ async def _lifespan(server: FastMCP):
     # Seed InMemory placeholder so tools that don't need vector search
     # can start immediately, before the background load completes.
     # decision_store is repointed to the same store — no separate table.
-    _placeholder = InMemoryVectorStore(embedder=MockEmbedder())
+    _placeholder = InMemoryVectorStore(embedder=KeylessEmbedder())
     _state._vector_store = _placeholder
     _state._decision_store = _placeholder
 
@@ -521,9 +521,10 @@ mcp = FastMCP(
     instructions=(
         "repowise is a codebase documentation engine. Use these tools to query "
         "the wiki for architecture overviews, contextual docs on files/modules/"
-        "symbols, modification risk assessment, architectural decision rationale, "
-        "semantic search, dependency paths, dead code, and architecture diagrams. "
-        "If the tools report that the repo has no index, tell the user to run "
+        "symbols, modification and change-risk assessment, architectural decision "
+        "rationale, semantic search, dead code, and code health. In workspace mode, "
+        "get_architecture and get_blast_radius are also available. If the tools "
+        "report that the repo has no index, tell the user to run "
         "'repowise init --yes' in the repo root; it needs no API key. Suggest it, "
         "do not run it yourself."
     ),
@@ -555,7 +556,12 @@ def create_mcp_server(
     deltas, or ``"all"``); when omitted the ``mcp.tools`` config block is used.
     """
     _state._repo_path = repo_path
+    from repowise.server.mcp_server import ensure_full_surface
     from repowise.server.mcp_server._tool_selection import apply_tool_selection
+
+    # Tool modules import lazily now, so a server has to ask for the full
+    # surface before it can advertise (or trim) it.
+    ensure_full_surface()
 
     apply_tool_selection(mcp, repo_path=repo_path, override=tools)
     return mcp
@@ -587,8 +593,8 @@ def _configure_network_binding(host: str) -> None:
 def run_mcp(
     transport: str = "stdio",
     repo_path: str | None = None,
-    port: int = 7338,
     host: str = "127.0.0.1",
+    port: int = 7338,
     tools: str | list[str] | None = None,
 ) -> None:
     """Run the MCP server with the specified transport.
@@ -602,17 +608,35 @@ def run_mcp(
     :func:`_configure_network_binding` for what changes when it's overridden.
     """
     _state._repo_path = repo_path
+    from repowise.server.mcp_server import ensure_full_surface
     from repowise.server.mcp_server._tool_selection import apply_tool_selection
 
+    ensure_full_surface()
     apply_tool_selection(mcp, repo_path=repo_path, override=tools)
 
     if transport == "sse":
+        mcp.settings.host = host
         mcp.settings.port = port
         _configure_network_binding(host)
+        if host in ("0.0.0.0", "::") and not os.environ.get("REPOWISE_API_KEY"):
+            _log.warning(
+                "SECURITY WARNING: MCP server (sse) is binding to %s without "
+                "REPOWISE_API_KEY. All tools are unauthenticated and "
+                "network-accessible. Set REPOWISE_API_KEY or bind to 127.0.0.1.",
+                host,
+            )
         mcp.run(transport="sse")
     elif transport == "streamable-http":
+        mcp.settings.host = host
         mcp.settings.port = port
         _configure_network_binding(host)
+        if host in ("0.0.0.0", "::") and not os.environ.get("REPOWISE_API_KEY"):
+            _log.warning(
+                "SECURITY WARNING: MCP server (streamable-http) is binding to %s without "
+                "REPOWISE_API_KEY. All tools are unauthenticated and "
+                "network-accessible. Set REPOWISE_API_KEY or bind to 127.0.0.1.",
+                host,
+            )
         mcp.run(transport="streamable-http")
     else:
         # stdout is the JSON-RPC channel on stdio, so every log line written

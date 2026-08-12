@@ -24,6 +24,12 @@ import re
 import subprocess
 from pathlib import Path
 
+# The adapter owns what Codex calls its shell tool; the installed matcher is
+# derived from it so the two cannot drift. Safe at module scope: the adapter
+# imports this module lazily, inside its methods, so there is no cycle, and
+# its own imports are stdlib only.
+from repowise.cli.agent_adapters.codex import SHELL_TOOL_MATCHER
+
 #: First Codex release whose PreToolUse hooks honor an ``updatedInput``
 #: command rewrite; earlier builds report it as an unsupported hook output.
 CODEX_REWRITE_MIN_VERSION: tuple[int, int] = (0, 137)
@@ -31,7 +37,7 @@ CODEX_REWRITE_MIN_VERSION: tuple[int, int] = (0, 137)
 _REWRITE_HOOK_COMMAND = "repowise-rewrite"
 
 _REWRITE_HOOK_ENTRY = {
-    "matcher": "Bash",
+    "matcher": SHELL_TOOL_MATCHER,
     "hooks": [
         {
             "type": "command",
@@ -41,6 +47,65 @@ _REWRITE_HOOK_ENTRY = {
         }
     ],
 }
+
+
+#: Matchers this entry has shipped with, current one excluded. An install
+#: predating a Codex tool rename holds one of these and therefore matches
+#: nothing — and because :func:`_is_rewrite_hook` keys on the *command*, a
+#: reinstall would find it, call it present, and leave it dead forever. So
+#: install upgrades a matcher it recognises as its own. Only these exact
+#: strings are moved: a user who narrowed the matcher deliberately keeps it.
+_LEGACY_REWRITE_MATCHERS = ("Bash",)
+
+
+def _migrate_rewrite_matcher(hook_list: list) -> bool:
+    """Repoint an existing repowise entry at the current matcher.
+
+    Returns True when something moved, so the caller knows to write.
+    """
+    changed = False
+    for entry in hook_list:
+        if not isinstance(entry, dict):
+            continue
+        if not any(_is_rewrite_hook(h) for h in entry.get("hooks", []) or []):
+            continue
+        if entry.get("matcher") in _LEGACY_REWRITE_MATCHERS:
+            entry["matcher"] = SHELL_TOOL_MATCHER
+            changed = True
+    return changed
+
+
+def migrate_codex_rewrite_hook() -> bool:
+    """Repoint an already-installed rewrite hook at the current matcher.
+
+    The twin of :func:`~repowise.cli.editor_integrations.claude_config.migrate_claude_code_hooks`,
+    and it exists for the same reason: a user who opted in before a Codex
+    tool rename holds an entry that matches nothing, and reinstalling is a
+    step nobody knows to take. Never installs — it only moves a matcher on an
+    entry that is already ours, so someone who removed the hook on purpose
+    stays without it. Returns True when the file was rewritten.
+    """
+    from repowise.cli.mcp_config import load_existing_config
+
+    hooks_path = _codex_hooks_path()
+    if not hooks_path.exists():
+        return False
+    try:
+        existing = load_existing_config(hooks_path)
+        hooks = existing.get("hooks")
+        if not isinstance(hooks, dict):
+            return False
+        pre_hooks = hooks.get("PreToolUse")
+        if not isinstance(pre_hooks, list):
+            return False
+        if not _migrate_rewrite_matcher(pre_hooks):
+            return False
+        hooks_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        return True
+    except Exception:
+        # Same posture as install: a malformed or unreadable hooks file is a
+        # migration that did not happen, never an error the user sees.
+        return False
 
 
 def _codex_hooks_path() -> Path:
@@ -108,6 +173,10 @@ def install_codex_rewrite_hook() -> Path | None:
         if not _has_rewrite_hook(pre_hooks):
             pre_hooks.append(json.loads(json.dumps(_REWRITE_HOOK_ENTRY)))
             hooks_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        elif _migrate_rewrite_matcher(pre_hooks):
+            # Present but pointed at a name Codex no longer uses. Reinstalling
+            # is the only repair path a user has, so it has to be one.
+            hooks_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         return hooks_path
     except Exception:
         # OSError on write, ClickException from load_existing_config on a
@@ -157,28 +226,50 @@ def uninstall_codex_rewrite_hook() -> bool:
 
 def codex_rewrite_hook_installed() -> bool:
     """True when the distill rewrite entry is registered in hooks.json."""
+    return codex_rewrite_hook_matcher() is not None
+
+
+def codex_rewrite_hook_matcher() -> str | None:
+    """The matcher on the installed rewrite entry, or None when not installed.
+
+    ``""`` is a real answer: an entry with no matcher at all. The caller needs
+    the matcher and not just its presence because the two say different
+    things — an entry whose matcher names a tool Codex has since renamed is
+    registered and will never fire.
+    """
     from repowise.cli.mcp_config import load_existing_config
 
     hooks_path = _codex_hooks_path()
     if not hooks_path.exists():
-        return False
+        return None
     try:
         existing = load_existing_config(hooks_path)
     except Exception:
-        return False
+        return None
     hooks = existing.get("hooks")
     if not isinstance(hooks, dict):
-        return False
+        return None
     pre_hooks = hooks.get("PreToolUse")
-    return isinstance(pre_hooks, list) and _has_rewrite_hook(pre_hooks)
+    if not isinstance(pre_hooks, list):
+        return None
+    return _rewrite_matcher(pre_hooks)
 
 
 def _is_rewrite_hook(hook: dict) -> bool:
     return _REWRITE_HOOK_COMMAND in hook.get("command", "")
 
 
+def _rewrite_matcher(hook_list: list) -> str | None:
+    """Matcher of the first entry carrying our hook, or None if there is none."""
+    for entry in hook_list:
+        if any(_is_rewrite_hook(h) for h in entry.get("hooks", [])):
+            matcher = entry.get("matcher")
+            return matcher if isinstance(matcher, str) else ""
+    return None
+
+
 def _has_rewrite_hook(hook_list: list) -> bool:
-    return any(_is_rewrite_hook(h) for entry in hook_list for h in entry.get("hooks", []))
+    return _rewrite_matcher(hook_list) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -218,22 +309,27 @@ def install_agents_md_distill_section(repo_path: Path) -> Path | None:
     already teaches distillation elsewhere (e.g. a future indexed-template
     section) is left untouched; otherwise the block is appended. Returns the
     AGENTS.md path, or None on write failure.
+
+    The marker mechanics live in ``agent_targets.formats.marker_block``; what
+    stays here is the Codex-specific policy — the section text, and the
+    "already taught elsewhere" bail, which is a judgement about this file's
+    content rather than about managed blocks in general.
     """
+    from repowise.cli.agent_targets.formats import marker_block
+
     target = _agents_md_path(repo_path)
-    wrapped = f"{_DISTILL_MARKER_START}\n{_DISTILL_SECTION}\n{_DISTILL_MARKER_END}"
     try:
-        if not target.exists():
-            content = f"{_NEW_FILE_PLACEHOLDER}\n{wrapped}\n"
-        else:
+        if target.exists():
             existing = target.read_text(encoding="utf-8")
-            if _DISTILL_MARKER_START in existing:
-                pattern = re.escape(_DISTILL_MARKER_START) + r".*?" + re.escape(_DISTILL_MARKER_END)
-                content = re.sub(pattern, wrapped, existing, flags=re.DOTALL)
-            elif _DISTILL_SECTION_HEADING in existing:
+            if _DISTILL_MARKER_START not in existing and _DISTILL_SECTION_HEADING in existing:
                 return target  # already taught elsewhere in the file
-            else:
-                content = existing.rstrip() + "\n\n" + wrapped + "\n"
-        target.write_text(content, encoding="utf-8", newline="\n")
+        marker_block.upsert(
+            target,
+            f"\n{_DISTILL_SECTION}\n",
+            _DISTILL_MARKER_START,
+            _DISTILL_MARKER_END,
+            new_file_prefix=_NEW_FILE_PLACEHOLDER,
+        )
         return target
     except OSError:
         return None
@@ -246,32 +342,14 @@ def remove_agents_md_distill_section(repo_path: Path) -> bool:
     is deleted entirely so install→uninstall round-trips to "no AGENTS.md".
     User content is never touched.
     """
-    target = _agents_md_path(repo_path)
-    if not target.exists():
-        return False
-    try:
-        existing = target.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    if _DISTILL_MARKER_START not in existing:
-        return False
+    from repowise.cli.agent_targets.formats import marker_block
 
-    pattern = (
-        r"\n*" + re.escape(_DISTILL_MARKER_START) + r".*?" + re.escape(_DISTILL_MARKER_END) + r"\n?"
+    return marker_block.remove(
+        _agents_md_path(repo_path),
+        _DISTILL_MARKER_START,
+        _DISTILL_MARKER_END,
+        delete_if_only=_NEW_FILE_PLACEHOLDER,
     )
-    remaining = re.sub(pattern, "", existing, flags=re.DOTALL)
-    if remaining and not remaining.endswith("\n"):
-        # Install rstrips before appending the block; restore the trailing
-        # newline that strip consumed so removal is a true inverse.
-        remaining += "\n"
-    try:
-        if remaining.strip() in ("", _NEW_FILE_PLACEHOLDER.strip()):
-            target.unlink()
-        else:
-            target.write_text(remaining, encoding="utf-8", newline="\n")
-    except OSError:
-        return False
-    return True
 
 
 def agents_md_distill_section_installed(repo_path: Path) -> bool:

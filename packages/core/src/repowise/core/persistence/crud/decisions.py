@@ -775,6 +775,7 @@ async def bulk_upsert_decisions(
             upsert_decision_vectors,
         )
         from repowise.core.persistence.vector_store import VectorStore
+        from repowise.core.providers.embedding import store_has_semantic_vectors
 
         # Static capability check: the base-class search_by_vector is the
         # "unsupported" sentinel. A runtime probe would conflate a transient
@@ -782,7 +783,12 @@ async def bulk_upsert_decisions(
         # O(N)-round-trip path this branch exists to avoid.
         store_cls_search = getattr(type(vector_store), "search_by_vector", None)
         supports_vector_search = (
-            callable(store_cls_search) and store_cls_search is not VectorStore.search_by_vector
+            callable(store_cls_search)
+            and store_cls_search is not VectorStore.search_by_vector
+            # A keyless store supports the call and cannot answer it: every
+            # matcher below refuses on it. Without this the batch pays for a
+            # full embed round whose vectors are then never read.
+            and store_has_semantic_vectors(vector_store)
         )
 
         ordered = [
@@ -1013,12 +1019,62 @@ async def purge_proposed_decisions_by_source(
     return len(ids)
 
 
+async def _fill_git_meta_gaps(
+    session: AsyncSession,
+    repository_id: str,
+    git_meta_map: dict[str, dict],
+    wanted: set[str],
+) -> dict[str, dict]:
+    """``git_meta_map`` widened with persisted rows for the *wanted* paths.
+
+    The caller's map is one run's git metadata, and on an incremental update
+    that is only the files that changed in it. Staleness scoring reads a path
+    with no entry as a file that is gone and scores it 1.00, so every decision
+    over an untouched file went maximally stale for not having been touched.
+    The persisted rows cover every file the index has seen, which is the set
+    that answers "is this file still here"; a path missing from those too is
+    genuinely untracked and still scores 1.00. The run's own entries win —
+    they are this run's fresher numbers for the files it re-read.
+    """
+    missing = wanted - git_meta_map.keys()
+    if not missing:
+        return git_meta_map
+
+    filled: dict[str, dict] = {}
+    # Chunked so the IN clause stays under SQLite's bind-parameter ceiling.
+    batch = sorted(missing)
+    for start in range(0, len(batch), 500):
+        rows = await session.execute(
+            select(GitMetadata).where(
+                GitMetadata.repository_id == repository_id,
+                GitMetadata.file_path.in_(batch[start : start + 500]),
+            )
+        )
+        for row in rows.scalars().all():
+            filled[row.file_path] = {
+                col.name: getattr(row, col.name)
+                for col in row.__table__.columns
+                if col.name not in ("id", "repository_id")
+            }
+    filled.update(git_meta_map)
+    return filled
+
+
 async def recompute_decision_staleness(
     session: AsyncSession,
     repository_id: str,
     git_meta_map: dict[str, dict],
 ) -> int:
-    """Recompute staleness_score for all active decisions. Returns update count."""
+    """Recompute staleness_score for all active decisions. Returns update count.
+
+    Also re-derives ``affected_modules_json`` from the files each record names.
+    The two belong in one pass because they are one repair: a record's module
+    linkage used to be the first path segment, which in a ``packages/`` layout
+    made almost every record claim ``packages`` or ``tests``, and the rows that
+    predate the fix carry it. Deriving here rather than in a data migration
+    keeps the single-repair-path rule — the one this repo already learned when
+    an alembic migration and a runtime repair disagreed about confidence.
+    """
     result = await session.execute(
         select(DecisionRecord).where(
             DecisionRecord.repository_id == repository_id,
@@ -1027,30 +1083,73 @@ async def recompute_decision_staleness(
     )
     decisions = list(result.scalars().all())
 
+    affected_by_id: dict[str, list[str]] = {}
+    for dec in decisions:
+        affected = json.loads(dec.affected_files_json)
+        if affected:
+            affected_by_id[dec.id] = affected
+
+    modules_updated = _backfill_module_nodes(decisions, affected_by_id)
+    if not affected_by_id:
+        if modules_updated:
+            await session.flush()
+        return 0
+
+    git_meta_map = await _fill_git_meta_gaps(
+        session,
+        repository_id,
+        git_meta_map,
+        {fp for paths in affected_by_id.values() for fp in paths},
+    )
+
     now = _now_utc()
     updated = 0
     for dec in decisions:
-        affected = json.loads(dec.affected_files_json)
+        affected = affected_by_id.get(dec.id)
         if not affected:
             continue
 
         from repowise.core.analysis.decision_extractor import DecisionExtractor
 
-        decision_text = f"{dec.title} {dec.decision} {dec.rationale}"
         new_score = DecisionExtractor.compute_staleness(
             dec.created_at,
             affected,
             git_meta_map,
-            decision_text=decision_text,
         )
         if abs(new_score - dec.staleness_score) > 0.01:
             dec.staleness_score = round(new_score, 3)
             dec.updated_at = now
             updated += 1
 
-    if updated:
+    if updated or modules_updated:
         await session.flush()
+    # Deliberately the staleness count alone. The callers print this as
+    # "N decisions rescored"; folding a silent module repair into it would
+    # report a rescore that did not happen.
     return updated
+
+
+def _backfill_module_nodes(
+    decisions: list[DecisionRecord],
+    affected_by_id: dict[str, list[str]],
+) -> int:
+    """Re-derive each record's module linkage from its files. Returns rows moved.
+
+    Records naming no file are left alone: there is nothing to derive from, and
+    an invented scope is worse than an absent one.
+    """
+    from repowise.core.analysis.decisions.scope import resolve_module_nodes
+
+    moved = 0
+    for dec in decisions:
+        affected = affected_by_id.get(dec.id)
+        if not affected:
+            continue
+        derived = resolve_module_nodes(affected)
+        if derived != json.loads(dec.affected_modules_json or "[]"):
+            dec.affected_modules_json = json.dumps(derived)
+            moved += 1
+    return moved
 
 
 async def get_stale_decisions(
@@ -1088,6 +1187,11 @@ async def get_decision_health_summary(
         "superseded": 0,
         "dismissed": 0,
         "stale": 0,
+        # Active records naming no file. They score 0.0 because the staleness
+        # question cannot be asked of them, which renders identically to a
+        # record whose code genuinely has not moved — so they are counted
+        # separately rather than banked as fresh.
+        "unscoped": 0,
     }
     stale_decisions: list[DecisionRecord] = []
     proposed_decisions: list[DecisionRecord] = []
@@ -1100,7 +1204,10 @@ async def get_decision_health_summary(
             if d.staleness_score >= 0.5:
                 counts["stale"] += 1
                 stale_decisions.append(d)
-            for fp in json.loads(d.affected_files_json):
+            affected_files = json.loads(d.affected_files_json)
+            if not affected_files:
+                counts["unscoped"] += 1
+            for fp in affected_files:
                 governed_files.add(fp)
         elif d.status == "proposed":
             proposed_decisions.append(d)

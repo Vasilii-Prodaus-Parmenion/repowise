@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import click
@@ -45,8 +46,8 @@ def _workspace_summary(path: Path) -> dict[str, object] | None:
 def _print_network_startup(
     transport: str,
     repo_path: Path,
-    port: int,
     host: str,
+    port: int,
     workspace: dict[str, object] | None,
 ) -> None:
     label = "streamable HTTP" if transport == "streamable-http" else "SSE"
@@ -56,6 +57,14 @@ def _print_network_startup(
         f"[bold green]Starting repowise MCP server ({label})[/bold green]\n"
         f"URL: http://{display_host}:{port}/{endpoint}"
     )
+
+    if not os.environ.get("REPOWISE_API_KEY") and host in ("0.0.0.0", "::"):
+        console.print(
+            "[bold yellow]SECURITY WARNING:[/bold yellow] MCP server is binding to "
+            f"[bold]{host}[/bold] without REPOWISE_API_KEY set. "
+            "All tools are unauthenticated and network-accessible. "
+            "Set REPOWISE_API_KEY or bind to 127.0.0.1."
+        )
 
     if workspace is not None:
         aliases = workspace["aliases"]
@@ -88,14 +97,15 @@ def _print_network_startup(
 )
 @click.option(
     "--host",
-    default="127.0.0.1",
+    default=None,
     help=(
-        "Bind host for HTTP/SSE transports (default: 127.0.0.1, loopback-only). "
-        "Set to 0.0.0.0 to accept connections from other machines. Doing so "
-        "also disables the built-in DNS-rebinding protection (which only "
-        "makes sense for loopback), so only bind non-loopback behind your "
-        "own network-level access control (firewall, VPN, or cloud ingress "
-        "IP restriction)."
+        "Host to bind for HTTP/SSE transports. Defaults to the REPOWISE_HOST "
+        "environment variable, or 127.0.0.1 (loopback-only). Use 0.0.0.0 to "
+        "listen on all interfaces — without REPOWISE_API_KEY set, a security "
+        "warning will be printed. Binding non-loopback also disables the "
+        "built-in DNS-rebinding protection (which only makes sense for "
+        "loopback), so only bind non-loopback behind your own network-level "
+        "access control (firewall, VPN, or cloud ingress IP restriction)."
     ),
 )
 @click.option(
@@ -120,7 +130,7 @@ def mcp_command(
     path: str | None,
     transport: str,
     port: int,
-    host: str,
+    host: str | None,
     tools: str | None,
     all_tools: bool,
 ) -> None:
@@ -160,8 +170,10 @@ def mcp_command(
             "Run 'repowise init' first to generate documentation."
         )
 
+    resolved_host = host or os.environ.get("REPOWISE_HOST", "127.0.0.1")
+
     if transport in {"sse", "streamable-http"}:
-        _print_network_startup(transport, repo_path, port, host, workspace)
+        _print_network_startup(transport, repo_path, resolved_host, port, workspace)
     else:
         # stdio mode — no console output (it would corrupt the protocol)
         pass
@@ -173,7 +185,7 @@ def mcp_command(
     run_mcp(
         transport=transport,
         repo_path=str(repo_path),
+        host=resolved_host,
         port=port,
-        host=host,
         tools=tools_override,
     )
