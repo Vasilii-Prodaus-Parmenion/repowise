@@ -280,6 +280,7 @@ async def run_pipeline(
             on_page_ready=on_page_ready,
             resume_controller=resume_controller,
             coverage_report_paths=coverage_report_paths,
+            derive_environment_facts=derive_environment_facts,
         )
     finally:
         # D6: the VB Roslyn sidecar is run-scoped to one run_pipeline() call.
@@ -319,6 +320,7 @@ async def _run_pipeline_body(
     on_page_ready: Any | None = None,
     resume_controller: ResumeController | None = None,
     coverage_report_paths: list[Path] | None = None,
+    derive_environment_facts: bool = False,
 ) -> PipelineResult:
     """Actual pipeline body — see :func:`run_pipeline` for the public
     signature and docstring. Split out so the public entry point can wrap
