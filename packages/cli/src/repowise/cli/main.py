@@ -26,6 +26,18 @@ def cli(ctx: click.Context) -> None:
             migrate_claude_code_hooks()
         except Exception:
             pass
+        # And the same for an installed Codex rewrite hook whose matcher
+        # names a tool Codex has since renamed. That one cannot self-heal
+        # from its own hook the way the Claude side does — a hook matching
+        # nothing never runs — so the CLI is the only place it can happen.
+        try:
+            from repowise.cli.editor_integrations.codex_config import (
+                migrate_codex_rewrite_hook,
+            )
+
+            migrate_codex_rewrite_hook()
+        except Exception:
+            pass
 
 
 _COMMANDS_PKG = "repowise.cli.commands"
@@ -53,6 +65,10 @@ _OSS_COMMANDS: tuple[tuple[str, str], ...] = (
     ("coverage", "coverage_cmd:coverage_group"),
     ("impacted-tests", "impacted_tests_cmd:impacted_tests_command"),
     ("search", "search_cmd:search_command"),
+    ("ask", "ask_cmd:ask_command"),
+    ("context", "context_cmd:context_command"),
+    ("symbol", "symbol_cmd:symbol_command"),
+    ("why", "why_cmd:why_command"),
     ("distill", "distill_cmd:distill_command"),
     ("expand", "expand_cmd:expand_command"),
     ("saved", "saved_cmd:saved_command"),

@@ -70,6 +70,14 @@ class Repository(Base):
     first_commit_subject: Mapped[str | None] = mapped_column(Text, nullable=True)
     total_lines_added: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_lines_deleted: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The commit the two churn totals above were computed at, so the next capture
+    # can add the range since it instead of re-walking the whole history (the
+    # walk was the single most expensive git call on the update path). Written
+    # only together with a churn figure, and only trusted after the next capture
+    # re-proves it is still an ancestor of HEAD and that the commit counts
+    # reconcile. NULL on indexes written before this, which just means the next
+    # capture walks once and anchors itself.
+    churn_anchor_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
     settings_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
@@ -232,7 +240,18 @@ class GraphNode(Base):
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
 
-    __table_args__ = (UniqueConstraint("repository_id", "node_id", name="uq_graph_node"),)
+    __table_args__ = (
+        UniqueConstraint("repository_id", "node_id", name="uq_graph_node"),
+        # ``node_type == "file"`` is the most-issued predicate on this table and
+        # nothing covered it: ``uq_graph_node`` is keyed ``(repository_id,
+        # node_id)``, so every "all the file nodes" read seeked on the repo and
+        # then filtered ~36k rows in memory to return ~3.4k. Measured on the
+        # repowise index, the two reads ``get_health`` issues per dashboard call
+        # (language map, test-path set): 29.0ms -> 9.2ms and 27.2ms -> 8.4ms.
+        # Audited for the LIMIT-without-ORDER-BY hazard 0046 records — every
+        # ``node_type``-filtered query in the tree that limits also orders.
+        Index("ix_graph_nodes_repo_type", "repository_id", "node_type"),
+    )
 
 
 class ExternalSystem(Base):
@@ -282,6 +301,12 @@ class GraphEdge(Base):
     imported_names_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     edge_type: Mapped[str] = mapped_column(String(64), nullable=False, default="imports")
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    # Provenance of a synthesised edge (e.g. "same_package", "header_source_pair").
+    # NULL for edges that come from a real import/using directive. Cycle detection
+    # reads it to drop intra-compilation-unit edges; see
+    # repowise.core.ingestion.cohesion. Persisted because the health engine and
+    # incremental updates run against a graph rehydrated from these rows.
+    hint_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
@@ -413,7 +438,22 @@ class WikiSymbol(Base):
         DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
     )
 
-    __table_args__ = (UniqueConstraint("repository_id", "symbol_id", name="uq_wiki_symbol"),)
+    __table_args__ = (
+        UniqueConstraint("repository_id", "symbol_id", name="uq_wiki_symbol"),
+        # The unique constraint's implicit index is keyed on ``symbol_id``, so a
+        # lookup by *file* could only seek on ``repository_id`` and then filter
+        # the repo's symbols in memory. That is the shape behind every
+        # file-scoped symbol join (health findings -> symbol ids, the file
+        # drawer, the symbol panel), not just one caller. Measured on a real
+        # 28,175-symbol index, a 400-path lookup returning 6,937 rows went
+        # 33.3ms -> 11.7ms, the plan flipping to a keyed seek, same rows.
+        #
+        # Adding this changed which index the planner picks for *other* queries
+        # on this table, and an unordered ``LIMIT`` there is decided by whatever
+        # order the chosen index walks. ``augment_cmd``'s symbol rescue had two
+        # such queries and now orders explicitly — see ``symbols_named``.
+        Index("ix_wiki_symbols_repo_path", "repository_id", "file_path"),
+    )
 
 
 class GitMetadata(Base):
@@ -1126,6 +1166,17 @@ class HealthFinding(Base):
         DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
     )
 
+    # The table had no index at all, so every read full-scanned it. Two shapes
+    # are served: a file-scoped lookup (``get_health`` with targets, the call an
+    # agent makes to self-check a file before and after an edit) and a
+    # repo-wide top-N ordered by impact. The first index turns the scan into a
+    # seek; the second lets the ranked read stop early instead of sorting the
+    # whole table into a temp B-tree.
+    __table_args__ = (
+        Index("ix_health_findings_repo_status_path", "repository_id", "status", "file_path"),
+        Index("ix_health_findings_repo_status_impact", "repository_id", "status", "health_impact"),
+    )
+
 
 class RefactoringSuggestion(Base):
     """One deterministic refactoring opportunity from the refactoring layer.
@@ -1191,6 +1242,13 @@ class HealthFileMetric(Base):
     defect_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     maintainability_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     performance_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Commit this row was scored against. Health is a separate pass from indexing
+    # and can lag it, so ``Repository.head_commit`` does not answer "how old is
+    # this score". Per-row rather than per-repo because the incremental path
+    # (``upsert_health_metrics``) rewrites only the files that changed, so the
+    # table legitimately holds rows from several passes at once. NULL on every
+    # row written before this column existed.
+    analyzed_commit: Mapped[str | None] = mapped_column(String(40), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
     )
@@ -1217,6 +1275,13 @@ class HealthSnapshot(Base):
     worst_performer_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     worst_performer_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     per_file_scores_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    # ``{path: total_deduction}`` for the files whose score is held at the
+    # floor, and only those — everywhere else the deduction is exactly
+    # ``10 - score``, so this carries what the clamp destroys and nothing more.
+    # A sibling column rather than a richer value inside ``per_file_scores_json``
+    # because that blob's ``{path: score}`` shape is parsed by three readers,
+    # two of which would fail quietly if a value became a dict.
+    per_file_deductions_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
 
 class CoverageFile(Base):

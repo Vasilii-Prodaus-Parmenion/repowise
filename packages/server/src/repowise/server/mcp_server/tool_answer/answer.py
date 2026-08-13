@@ -15,6 +15,12 @@ search → context → read loop with one tool call that returns:
                                    follow-up); present only when the answer
                                    names a function/method/class that was
                                    hydrated
+      "episodes":          list  — at most one dated fact recorded about this
+                                   checkout that bears on the question, served
+                                   beside the answer and never in place of it;
+                                   present only when its scope intersects the
+                                   answer's and confidence is below high (see
+                                   ``episodes``)
       "more_definitions":  list    only on an answer-by-union (homonym) reply
                                    whose bodies overflowed the char budget:
                                    {file, name, line, symbol_id, hint} entries
@@ -127,6 +133,7 @@ from repowise.server.mcp_server.tool_answer.config import (
     _INLINE_BODY_MAX_LINES,
     _INLINE_BODY_MAX_SYMBOLS,
     _PAGE_EXCERPT_HITS,
+    _SYMBOL_AGREEMENT_TOP_RANK_MAX,
     _SYSTEM_PROMPT,
     _USER_TEMPLATE,
 )
@@ -134,7 +141,11 @@ from repowise.server.mcp_server.tool_answer.data_shape import (
     _is_data_shape_question,
     mine_data_shape,
 )
+from repowise.server.mcp_server.tool_answer.episodes import (
+    attach_episode as _attach_episode,
+)
 from repowise.server.mcp_server.tool_answer.retrieval import (
+    _CANDIDATE_LIMIT,
     _apply_domain_penalty,
     _attach_page_excerpts,
     _candidate_justification,
@@ -185,6 +196,12 @@ if _MAX_CHARS_PER_HIT_EXCERPT < _GATED_EXCERPT_CHARS:
 # value (0/off/false/no) to restore the legacy abstain-on-ambiguous behaviour.
 _ALWAYS_SYNTHESIZE_ENV = "REPOWISE_ANSWER_ALWAYS_SYNTHESIZE"
 _AGREEMENT_CONFIDENCE_ENV = "REPOWISE_ANSWER_AGREEMENT_CONFIDENCE"
+# The keyless-only half of that signal (FTS + symbol in place of FTS + vector,
+# which a keyless index can never produce). Its own flag on purpose: the pair
+# above was tuned against the 99-question eval, whereas this substitutes a leg
+# the fusion already prices at a third weight, so it must be reversible and
+# A/B-able WITHOUT also switching off the measured half.
+_SYMBOL_AGREEMENT_ENV = "REPOWISE_ANSWER_SYMBOL_AGREEMENT"
 # Keep the exact_symbol union fast path from hijacking a "how does X work"
 # mechanism question, whose real answer often lives in a different file than the
 # named symbol's body.
@@ -278,15 +295,30 @@ def _agreement_confidence_enabled() -> bool:
     }
 
 
-def _agreement_dominant(hits: list[dict]) -> bool:
+def _symbol_agreement_enabled() -> bool:
+    """Whether a keyless index may read agreement from FTS + the symbol leg.
+
+    Independently reversible from :func:`_agreement_confidence_enabled`, which
+    governs the measured FTS + vector pair. Turning this off restores the state
+    where a keyless index simply cannot earn the agreement lift.
+    """
+    return os.environ.get(_SYMBOL_AGREEMENT_ENV, "").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _agreement_dominant(hits: list[dict], *, vector_leg_keyless: bool = False) -> bool:
     """True when the top hit is the confident pick by retriever AGREEMENT.
 
     RRF fusion compresses scores: a page both retrievers rank #1 barely
     outscores one they rank #2 (ratio ~1.017), so the numeric dominance ratio
     calls the *most* confident retrieval "non-dominant" and demotes it. This
-    reads the per-source ranks (``_fts_rank`` / ``_vec_rank``) instead: when FTS
-    and vector independently put the SAME page at (or within a rank of) the top,
-    that consensus is a stronger ground-truth signal than any RRF score margin.
+    reads the per-source ranks instead: when two retrievers put the SAME page at
+    (or within a rank of) the top, that consensus is a stronger ground-truth
+    signal than any RRF score margin.
 
     Conservative. Requires the top hit to be found by BOTH retrievers near the
     top of each, to rank no lower than the runner-up in either source, and the
@@ -294,30 +326,66 @@ def _agreement_dominant(hits: list[dict]) -> bool:
     lower-ranked in a source). Otherwise returns False and the caller falls back
     to the pure ratio/gap gate. Agreement can only LIFT — the demotion gates
     still apply.
+
+    ``vector_leg_keyless`` swaps the vector leg for the symbol leg. On an index
+    with no semantic vectors the vector leg is skipped outright, so ``_vec_rank``
+    is never written for any question and a fixed FTS+vector pair makes this
+    signal permanently unreachable — every keyless answer is then graded by the
+    pure ratio gate, which is exactly the gate this function exists because it
+    mis-reads. The symbol leg runs on every index and records ``_sym_rank``.
+
+    **The caller must pass the retrieval leg's own status, not infer it from
+    the hits.** By the time this runs, ``hits`` is capped to the top 5 out of a
+    much larger fused pool, so "no hit carries a ``_vec_rank``" is *not*
+    evidence the leg was skipped: a keyed index whose vector leg timed out,
+    errored, was scope-filtered, or was simply outranked by five FTS-and-symbol
+    hits presents identically. Substituting on that inference would fire exactly
+    when evidence is weakest and manufacture "high" confidence from it.
+
+    The symbol pair is held to a stricter rank than the vector pair. FTS and the
+    symbol leg are not independent — the wiki page FTS indexes contains the
+    public symbol table the symbol leg matches on — so their agreeing is closer
+    to one lexical match observed twice than to two retrievers concurring. The
+    fusion beside this already prices that leg at a third of the others'
+    (``_SYMBOL_LEG_RRF_K`` 180 vs ``_RRF_K`` 60, after a same-named React
+    component displaced the right file on the 99-question eval). Requiring an
+    exact rank-0 tie keeps the weaker signal from carrying the stronger claim.
+
+    Note the consequence: at ``top_rank_max = 0`` the runner-up comparison below
+    can no longer reject anything, because two hits cannot share rank 0 within
+    one leg. The symbol pair therefore reduces exactly to "the top hit is #1 in
+    FTS and #1 in the symbol leg", which is the intended rule; the shared gap
+    check is retained for the vector pair, where it does constrain.
     """
     if len(hits) < 2:
         return False
+    if vector_leg_keyless:
+        second_field = "_sym_rank"
+        top_rank_max = _SYMBOL_AGREEMENT_TOP_RANK_MAX
+    else:
+        second_field = "_vec_rank"
+        top_rank_max = _AGREEMENT_TOP_RANK_MAX
     top = hits[0]
-    top_fts = top.get("_fts_rank")
-    top_vec = top.get("_vec_rank")
+    top_a = top.get("_fts_rank")
+    top_b = top.get(second_field)
     # Top must be a consensus pick: found by both retrievers, near the top of
     # each. A one-retriever top hit is exactly the ambiguous case we must NOT
     # lift.
-    if top_fts is None or top_vec is None:
+    if top_a is None or top_b is None:
         return False
-    if top_fts > _AGREEMENT_TOP_RANK_MAX or top_vec > _AGREEMENT_TOP_RANK_MAX:
+    if top_a > top_rank_max or top_b > top_rank_max:
         return False
     second = hits[1]
-    sec_fts = second.get("_fts_rank")
-    sec_vec = second.get("_vec_rank")
+    sec_a = second.get("_fts_rank")
+    sec_b = second.get(second_field)
     # Runner-up found by only one retriever → the consensus top clearly wins.
-    if sec_fts is None or sec_vec is None:
+    if sec_a is None or sec_b is None:
         return True
     # Runner-up found by both: the top must rank at least as high in BOTH
     # sources (no source disagrees) and strictly ahead in at least one.
-    if top_fts <= sec_fts and top_vec <= sec_vec:
-        return (sec_fts - top_fts) >= _AGREEMENT_RANK_GAP or (
-            sec_vec - top_vec
+    if top_a <= sec_a and top_b <= sec_b:
+        return (sec_a - top_a) >= _AGREEMENT_RANK_GAP or (
+            sec_b - top_b
         ) >= _AGREEMENT_RANK_GAP
     return False
 
@@ -334,12 +402,76 @@ def _build_best_guesses(hits: list[dict]) -> list[dict]:
             "file": h.get("target_path"),
             "why_relevant": _candidate_justification(h),
             "score": round(h.get("score", 0.0), 3),
-            "domain_penalty": h.get("_domain_penalty"),
+            # Absent rather than null. It was `null` in all six wire samples
+            # measured 2026-08-11 — a penalty applies to a minority of hits, so
+            # the common row paid 22 characters to say nothing happened.
+            **({"domain_penalty": h["_domain_penalty"]} if h.get("_domain_penalty") else {}),
             **({"excerpt": h["excerpt"]} if h.get("excerpt") else {}),
         }
         for h in hits[:_GATED_RETURN_HITS]
         if h.get("target_path")
     ]
+
+
+def _trim_served_payload(payload: dict) -> dict:
+    """Every size cut that runs on the way OUT, on both the fresh and cache paths.
+
+    Serve-time rather than build-time, and that is the whole point. A cut
+    applied where the payload is assembled reaches only fresh answers: a cache
+    row written by an older build keeps the old shape until
+    ``_ANSWER_SCHEMA_VERSION`` moves, and bumping that invalidates every user's
+    answer cache — re-synthesis, i.e. real provider spend — to change the size
+    of a block. Measured: after capping ``candidates`` at build time only, a
+    re-measured ``get_answer`` came back byte-identical, because the tree's
+    cache answered. Trimming on the way out fixes old and new rows alike and
+    costs nobody a re-synthesis.
+
+    Anything that only REMOVES redundancy belongs here. Anything that changes
+    what an answer says does not, and still owes a schema bump.
+    """
+    _cap_candidates(payload)
+    _drop_duplicated_guess_excerpts(payload)
+    return payload
+
+
+def _cap_candidates(payload: dict) -> dict:
+    """Hold ``candidates`` to :data:`_CANDIDATE_LIMIT` rows on the way out."""
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list) and len(candidates) > _CANDIDATE_LIMIT:
+        payload["candidates"] = candidates[:_CANDIDATE_LIMIT]
+    return payload
+
+
+def _drop_duplicated_guess_excerpts(payload: dict) -> dict:
+    """Drop ``best_guesses[].excerpt`` where ``retrieval[]`` already carries it.
+
+    Both blocks slice the same 1,500-character page excerpt for the same file,
+    and when both are present the guess copy is byte-for-byte redundant —
+    measured at 4,714 characters, 21.3% of one low-confidence payload, 3 of 3
+    guesses duplicated.
+
+    **Conditional, and the condition matters.** ``retrieval`` is
+    confidence-gated and shrinks to nothing as the prose gets more
+    trustworthy; the legacy abstain path ships ``retrieval: []`` outright. On
+    those responses the guess excerpt is the only content in the payload, not a
+    duplicate of anything, and a sample measured here carried 4,667 characters
+    of it. So the drop is keyed on the duplicate actually being present, which
+    makes it lossless rather than merely cheap — and keeps every ``excerpt``
+    mentioned by ``note`` / ``next_action_hint`` on the paths that mention it.
+    """
+    guesses = payload.get("best_guesses")
+    if not guesses:
+        return payload
+    # Substring, not equality: the two blocks cut their slabs independently and
+    # the retrieval one is the longer of the two where they differ.
+    carried = [r["excerpt"] for r in (payload.get("retrieval") or []) if r.get("excerpt")]
+    if not carried:
+        return payload
+    for guess in guesses:
+        excerpt = guess.get("excerpt")
+        if excerpt and any(excerpt in c for c in carried):
+            del guess["excerpt"]
+    return payload
 
 
 def _json_default(obj):
@@ -637,10 +769,36 @@ def _degraded_payload(
     read freshness and health signals from there. The failure path used to
     set only the top-level key, so a caller watching ``_meta`` saw a normal
     empty answer.
+
+    ``answer`` states what the payload IS rather than being left empty. Only
+    the synthesis step is missing here. Retrieval ran, ranked the corpus and
+    succeeded, and its result is the most useful part of a normal reply. An
+    empty ``answer`` beside it reads as a failed call rather than a partial
+    one, and a reader who takes it at face value discards a working result and
+    starts over. The sentence is assembled from what the payload actually
+    carries, so it can never claim more than it has, and no prose about the
+    question itself is invented, that being precisely the part that needs a
+    provider.
     """
+    served = len(hits)
+    if served:
+        summary = (
+            f"No synthesized prose ({reason}), but retrieval succeeded and this "
+            f"payload is usable: {served} ranked "
+            f"{'hit' if served == 1 else 'hits'} in `retrieval`, the files to open "
+            "in `fallback_targets`, and the wider ranked shortlist in `candidates`. "
+            "Read those rather than starting a fresh search."
+        )
+    else:
+        summary = (
+            f"No synthesized prose ({reason}), and retrieval matched nothing for "
+            "this question. Rephrase with an identifier or path from the codebase, "
+            "or search directly."
+        )
+
     return _with_candidates(
         {
-            "answer": "",
+            "answer": summary,
             "citations": [],
             "confidence": "low",
             "degraded": reason,
@@ -680,6 +838,9 @@ async def get_answer(
     retrieval_quality separately rates the retrieval that fed synthesis.
     When the answer names a function/method/class, ``symbol_bodies`` carries
     its full live body — read that instead of a follow-up get_symbol.
+    ``episodes``, when present, is a dated fact recorded about this checkout
+    that bears on the question — evidence beside the answer, not a correction
+    of it. Weigh it against the answer; ``still_true`` says how current it is.
 
     Args:
         question: developer question.
@@ -820,6 +981,17 @@ async def get_answer(
                     targets=[p for p in cached_paths if isinstance(p, str) and p],
                 )
                 _apply_lean_high(payload, question)
+                _trim_served_payload(payload)
+                # Serve-time, on this path as well as the fresh one: the
+                # episode is read on every call and never cached into an
+                # answer, so a disagreement cannot be frozen into a row and
+                # served after the episode has been superseded.
+                await _attach_episode(
+                    payload,
+                    question=question,
+                    repo_path=getattr(ctx, "path", None),
+                    repo_name=getattr(repository, "name", None),
+                )
                 return payload
 
     # --- Retrieval pipeline ------------------------------------------------
@@ -1138,7 +1310,20 @@ async def get_answer(
     # that RRF fusion compresses out of the numeric score. Computed once and
     # OR'd into every place the ratio/gap gate decides dominance, so it can
     # only LIFT a retrieval — never demote one the ratio already trusts.
-    agreement_dominant = _agreement_dominant(hits) if _agreement_confidence_enabled() else False
+    # Read the vector leg's own recorded status rather than inferring it from
+    # `hits`, which is capped to 5 by here: "no _vec_rank in the top 5" is also
+    # what a timed-out, errored, scope-filtered or simply outranked vector leg
+    # looks like, and those must NOT fall back to the symbol leg.
+    agreement_dominant = (
+        _agreement_dominant(
+            hits,
+            vector_leg_keyless=(
+                _symbol_agreement_enabled() and _retrieval_legs().get("vector") == "keyless"
+            ),
+        )
+        if _agreement_confidence_enabled()
+        else False
+    )
     dominant = True
     if len(hits) >= 2:
         top_score = hits[0].get("score", 0.0)
@@ -1802,4 +1987,20 @@ async def get_answer(
     if degraded := _degraded_legs(_retrieval_legs()):
         payload["_meta"]["retrieval_degraded"] = degraded
     _apply_lean_high(payload, question)
+    # After the cache write above and after lean-high (which can remove
+    # ``best_guesses`` outright), so the cut sees the finished payload and the
+    # cached row keeps the shape its schema version promises.
+    _trim_served_payload(payload)
+    # After the cache write above, deliberately. ``cache_payload`` is a shallow
+    # copy taken before this point, so the episode reaches the caller and never
+    # the cache row — which is why adding it needs no _ANSWER_SCHEMA_VERSION
+    # bump: a row written before this change and one written after are the same
+    # bytes, and bumping would invalidate every user's cache for a field that
+    # is not in it.
+    await _attach_episode(
+        payload,
+        question=question,
+        repo_path=getattr(ctx, "path", None),
+        repo_name=getattr(repository, "name", None),
+    )
     return payload

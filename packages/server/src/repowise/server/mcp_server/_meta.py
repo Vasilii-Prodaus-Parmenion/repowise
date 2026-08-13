@@ -225,8 +225,13 @@ def freshness_from_repo(repository: Any | None, targets: list[str] | None = None
     Conditionally emitted:
       * ``live_head``       — only when it differs from the indexed commit
       * ``stale_warning``   — only on a real signal (a served target changed,
-        HEAD mismatch on a repo-level response, OR very old with no git)
-      * ``index_behind``    — HEAD moved but no served target is affected
+        HEAD mismatch with real file changes on a repo-level response, OR very
+        old with no git)
+      * ``index_behind``    — HEAD moved but nothing the response serves is
+        affected: either no served target changed, or the two commits have
+        identical trees so *no* file changed at all. The second case used to
+        warn on every repo-level response, which is the loudest possible way to
+        be wrong about a repo that is completely current.
 
     Defensive throughout: any missing piece is dropped rather than raised so
     an upstream change to the Repository model can never poison a tool result.
@@ -257,11 +262,19 @@ def freshness_from_repo(repository: Any | None, targets: list[str] | None = None
         if live_full != indexed_full:
             out["live_head"] = live_full[:12]
             changed = (
-                _changed_files_between(local_path, indexed_full, live_full)
-                if targets is not None and local_path
-                else None
+                _changed_files_between(local_path, indexed_full, live_full) if local_path else None
             )
-            if targets is not None and changed is not None:
+            if changed is not None and not changed:
+                # HEAD moved but the two trees are identical (an empty commit, a
+                # merge that changed nothing, a tag-only move). Nothing this or
+                # any other response serves can be stale, so the repo-level
+                # warning was crying wolf on a repo that was completely current —
+                # and a warning that fires when nothing changed trains an agent
+                # to stop reading the field. Checked before the targets branch
+                # because it holds for repo-level responses too, which are
+                # exactly the ones that previously always warned.
+                out["index_behind"] = True
+            elif targets is not None and changed is not None:
                 if targets_hit_by_changes(targets, changed):
                     out["stale_warning"] = (
                         "A file this response serves changed after indexing — "
@@ -337,17 +350,28 @@ def _embedder_meta() -> dict[str, Any]:
     agent can detect — programmatically — that semantic search is broken instead
     of trusting empty/garbage retrieval. Emits nothing when the embedder is
     healthy or unresolved, so healthy responses stay clean.
+
+    A *keyless* index is a different state and gets a different field. Nothing
+    is broken and nothing was misconfigured, so it is not flagged as degraded;
+    but retrieval really is full-text-only, and a caller that assumes semantic
+    matching is running will misread a lexical miss as "not in the codebase".
+    ``semantic_search: false`` says so once per response without crying wolf.
     """
     # Lazy import: `_state` is a sibling module; importing it at call-time keeps
     # `_meta` free of any package import-ordering coupling.
     from repowise.server.mcp_server import _state
 
     status = getattr(_state, "_embedder_status", None)
-    if not status or not status.get("degraded"):
+    if not status:
+        return {}
+    if not status.get("degraded"):
+        if status.get("active") == "mock":
+            return {"embedder": "mock", "semantic_search": False}
         return {}
     out: dict[str, Any] = {
         "embedder": status.get("active", "mock"),
         "embedder_degraded": True,
+        "semantic_search": False,
     }
     reason = status.get("reason")
     if reason:

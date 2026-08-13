@@ -718,10 +718,14 @@ def _resolve_title(overview_page: Page | None, repository: Any) -> str:
 async def _build_code_health(session: Any, repository: Any) -> dict[str, Any]:
     """Headline code-health KPIs; empty when health hasn't been run on this repo."""
     try:
-        health_summary = await _get_health_summary(session, repository.id)
+        # Metrics first, handed to the summary: it reads the same table, and
+        # that read now also aggregates the per-file deduction used to rank
+        # floored files, so letting it load its own copy pays for the ranking
+        # twice.
         metrics_rows = await _get_health_metrics(session, repository.id)
         if not metrics_rows:
             return {}
+        health_summary = await _get_health_summary(session, repository.id, metrics=metrics_rows)
         # Hotspot health: NLOC-weighted avg over the top-25% files by NLOC,
         # matching the dashboard KPI definition.
         sorted_by_nloc = sorted(metrics_rows, key=lambda m: m.nloc or 0, reverse=True)
@@ -1023,9 +1027,14 @@ async def get_overview(repo: str | None = None, include: list[str] | None = None
         result["tool_guide"] = {
             "first_call": "get_answer for any how/where/why question; trust "
             "confidence=high directly (it is content-grounded).",
-            "reading_code": "get_context skeleton (≈37% of a full Read) → "
-            "get_symbol for bodies (verified: true = no re-read needed). "
-            "Raw Read only for files marked mostly_full or unservable.",
+            # NOT "get_context skeleton -> get_symbol for bodies". That routed
+            # the agent into a per-signature walk, which is where three
+            # quarters of every measured session's retrieval calls went, on the
+            # one tool whose payload cannot be trimmed. get_context serves no
+            # source by default now, so this names the two whole-file routes.
+            "reading_code": 'get_context(include=["skeleton"]) for a whole file '
+            "verified, or just Read it. get_symbol only for an id a response "
+            "already gave you — never file-by-signature.",
             "recipes": [
                 "get_answer low confidence → Read best_guesses[0].file",
                 "get_context hotspot: true → get_risk before editing",

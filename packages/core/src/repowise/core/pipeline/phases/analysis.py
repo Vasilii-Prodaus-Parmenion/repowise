@@ -40,6 +40,8 @@ async def _run_dead_code_analysis(
     git_meta_map: dict[str, dict],
     *,
     source_map: dict[str, bytes] | None = None,
+    repo_path: Any | None = None,
+    traversal_stats: Any | None = None,
     progress: ProgressCallback | None,
 ) -> Any | None:
     """Run dead code detection (pure graph traversal, no LLM)."""
@@ -52,11 +54,21 @@ async def _run_dead_code_analysis(
         if progress:
             progress.on_phase_start("dead_code", dead_code_steps)
 
+        # Source files the traverser dropped on size. Without them the
+        # analyzer cannot tell "nothing imports this" from "the importer was
+        # never read", which is the cascade in #1237.
+        unindexed_source_files = [
+            (skipped.path, skipped.reason)
+            for skipped in getattr(traversal_stats, "skipped_source_files", [])
+        ]
+
         analyzer = DeadCodeAnalyzer(
             graph_builder.graph(),
             git_meta_map,
             parsed_files=graph_builder._parsed_files,
             source_map=source_map,
+            repo_root=repo_path,
+            unindexed_source_files=unindexed_source_files,
         )
 
         def _step(_stage: str) -> None:
@@ -210,6 +222,7 @@ async def _run_health_analysis(
             module_map=module_map,
             coverage_map=coverage_map,
             duplication_cache_dir=(repo_path / ".repowise") if repo_path is not None else None,
+            repo_root=repo_path,
         )
 
         # Load per-file override rules from `.repowise/health-rules.json`.
@@ -314,7 +327,11 @@ async def _run_decision_extraction(
                 session_mining_enabled,
             )
 
-            if llm_client is not None and session_mining_enabled(repo_cfg):
+            # Not gated on a provider: the same pass records transcript
+            # episodes, which need no model, and gating the read on a key
+            # would leave a keyless index with no transcript supply at all.
+            # The miner skips its own structuring pass when provider is None.
+            if session_mining_enabled(repo_cfg):
                 session_decisions = await asyncio.wait_for(
                     mine_session_decisions(repo_path, provider=llm_client),
                     timeout=DECISION_EXTRACTION_TIMEOUT_SECS,

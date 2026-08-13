@@ -2,10 +2,12 @@
 
 Workhorse for "what is this and what touches it" questions. Returns a triage
 card by default (title, summary, signatures, hotspot bit, top callers, pointers
-to risk / why / symbol). NOT a source-body tool — for raw bytes call
-``get_symbol("path::Name")`` instead. The split keeps the cached prompt prefix
-small on multi-turn agent sessions: ``get_context`` stays under ~2k tokens for
-common targets, while ``get_symbol`` returns bounded bytes for one symbol.
+to risk / why / symbol). **NOT a source-body tool.** For source, ask for it in
+one call — ``include=["skeleton"]`` returns the whole file body-elided and
+line-verified — or just Read the file. Reaching for ``get_symbol`` once per
+signature in the card is the expensive path and the card does not recommend it.
+The split keeps the cached prompt prefix small on multi-turn agent sessions:
+``get_context`` stays under ~2k tokens for common targets.
 
 Optional ``include`` parameter widens the response:
   - include=["full_doc"]  → full wiki markdown content
@@ -32,6 +34,7 @@ from repowise.core.persistence.database import get_session
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server import _state
 from repowise.server.mcp_server._budget import OmissionCollector, truncate_to_budget
+from repowise.server.mcp_server._episodes import enrich_episode_counts as _enrich_episodes
 from repowise.server.mcp_server._helpers import (
     _get_exclude_spec,
     _get_repo,
@@ -54,14 +57,16 @@ async def get_context(
 ) -> dict:
     """Triage card for files / modules / symbols — relationships, not source bytes.
 
-    Returns title, summary, signatures, hotspot bit, decision_record titles,
-    and symbol_ids to pipe into get_symbol (cheaper than Read for bodies).
-    fix_history appears only on files with counted bug fixes (count, age,
-    bug_magnet); hotspot is churn. Either one is a cue to call get_risk.
-    Batch targets in one call. File targets above ~80 lines default to a
-    skeleton (every signature + top-PageRank bodies, with a verified flag —
-    a fraction of Read cost); ``mostly_full`` marks files where a direct
-    Read costs little more.
+    Returns title, summary, signatures with line numbers, hotspot bit, and
+    decision_record titles. fix_history appears only on files with counted bug
+    fixes (count, age, bug_magnet); hotspot is churn. Either one is a cue to
+    call get_risk. episodes counts the dated records bound to a target — what
+    happened here and why — and appears only when there is at least one;
+    get_why serves the bodies. A symbol target is counted as its file, and a
+    module aggregates everything beneath it.
+    Batch targets in one call. No source bytes by default: pass
+    include=["skeleton"] for the whole file body-elided and line-verified in
+    ONE call, or Read it. Do not call get_symbol per signature.
 
     Args:
         targets: file paths, module paths, or "path::Symbol" ids.
@@ -130,6 +135,11 @@ async def get_context(
             )
         else:
             results.append(r)
+
+    # One integer per target: how many dated episodes are bound here. A number
+    # invites a follow-up get_why; a paragraph would spend the budget of every
+    # caller that only wanted the triage card. Absent rather than zero.
+    await asyncio.to_thread(_enrich_episodes, results, ctx.path)
 
     response: dict[str, Any] = {
         "targets": {r["target"]: r for r in results},

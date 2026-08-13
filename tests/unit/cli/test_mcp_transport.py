@@ -31,6 +31,7 @@ def test_mcp_cli_passes_tools_override(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert captured["tools"] == "+get_execution_flows,-get_dead_code"
+    assert captured["host"] == "127.0.0.1"
 
 
 def test_mcp_cli_all_flag_overrides_tools(monkeypatch, tmp_path: Path) -> None:
@@ -44,6 +45,7 @@ def test_mcp_cli_all_flag_overrides_tools(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert captured["tools"] == "all"
+    assert captured["host"] == "127.0.0.1"
 
 
 def test_mcp_cli_accepts_streamable_http_transport(
@@ -75,6 +77,7 @@ def test_mcp_cli_accepts_streamable_http_transport(
     assert captured == {
         "transport": "streamable-http",
         "repo_path": str(tmp_path.resolve()),
+        "host": "127.0.0.1",
         "port": 7339,
         "tools": None,
     }
@@ -126,6 +129,7 @@ def test_mcp_cli_streamable_http_prints_workspace_summary(
     assert captured == {
         "transport": "streamable-http",
         "repo_path": str(workspace.resolve()),
+        "host": "127.0.0.1",
         "port": 7341,
         "tools": None,
     }
@@ -152,6 +156,7 @@ def test_run_mcp_dispatches_streamable_http(monkeypatch) -> None:
 
     _server.run_mcp(transport="streamable-http", repo_path="/tmp/repo", port=7340)
 
+    assert _server.mcp.settings.host == "127.0.0.1"
     assert _server.mcp.settings.port == 7340
     assert calls == [{"transport": "streamable-http"}]
     assert watchdog_started is False
@@ -181,3 +186,104 @@ def test_run_mcp_keeps_existing_stdio_and_sse_dispatch(monkeypatch) -> None:
 
     assert calls == [{"transport": "sse"}, {"transport": "stdio"}]
     assert watchdog_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# New tests: --host flag, REPOWISE_HOST env, security warnings
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_cli_passes_host_to_run_mcp(monkeypatch, tmp_path: Path) -> None:
+    """--host 0.0.0.0 is forwarded to run_mcp."""
+    (tmp_path / ".repowise").mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw))
+    monkeypatch.delenv("REPOWISE_API_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["mcp", str(tmp_path), "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "7342"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["host"] == "0.0.0.0"
+
+
+def test_mcp_cli_defaults_host_to_loopback(monkeypatch, tmp_path: Path) -> None:
+    """No --host flag → run_mcp receives host='127.0.0.1'."""
+    (tmp_path / ".repowise").mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw))
+    monkeypatch.delenv("REPOWISE_HOST", raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["mcp", str(tmp_path), "--transport", "streamable-http", "--port", "7342"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["host"] == "127.0.0.1"
+
+
+def test_mcp_cli_inherits_repowise_host_env(monkeypatch, tmp_path: Path) -> None:
+    """REPOWISE_HOST=0.0.0.0 (no --host flag) → run_mcp receives host='0.0.0.0'."""
+    (tmp_path / ".repowise").mkdir()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: captured.update(kw))
+    monkeypatch.setenv("REPOWISE_HOST", "0.0.0.0")
+    monkeypatch.delenv("REPOWISE_API_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["mcp", str(tmp_path), "--transport", "streamable-http", "--port", "7342"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["host"] == "0.0.0.0"
+
+
+def test_mcp_cli_prints_security_warning_on_wide_bind(monkeypatch, tmp_path: Path) -> None:
+    """--host 0.0.0.0 without REPOWISE_API_KEY → security warning in output."""
+    (tmp_path / ".repowise").mkdir()
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: None)
+    monkeypatch.delenv("REPOWISE_API_KEY", raising=False)
+
+    result = CliRunner().invoke(
+        cli,
+        ["mcp", str(tmp_path), "--transport", "streamable-http", "--host", "0.0.0.0"],
+    )
+
+    assert result.exit_code == 0
+    assert "SECURITY WARNING" in result.output
+    assert "0.0.0.0" in result.output
+    assert "REPOWISE_API_KEY" in result.output
+
+
+def test_mcp_cli_no_warning_with_api_key(monkeypatch, tmp_path: Path) -> None:
+    """--host 0.0.0.0 WITH REPOWISE_API_KEY → no security warning."""
+    (tmp_path / ".repowise").mkdir()
+    monkeypatch.setattr("repowise.server.mcp_server.run_mcp", lambda **kw: None)
+    monkeypatch.setenv("REPOWISE_API_KEY", "some-key")
+
+    result = CliRunner().invoke(
+        cli,
+        ["mcp", str(tmp_path), "--transport", "streamable-http", "--host", "0.0.0.0"],
+    )
+
+    assert result.exit_code == 0
+    assert "SECURITY WARNING" not in result.output
+
+
+def test_run_mcp_sets_host_on_settings(monkeypatch) -> None:
+    """run_mcp sets mcp.settings.host (parallel to existing port test)."""
+    from repowise.server.mcp_server import _server
+
+    calls: list[dict] = []
+    monkeypatch.setattr(_server.mcp, "run", lambda **kw: calls.append(kw))
+    monkeypatch.delenv("REPOWISE_API_KEY", raising=False)
+
+    _server.run_mcp(transport="streamable-http", host="0.0.0.0", port=7343)
+
+    assert _server.mcp.settings.host == "0.0.0.0"
+    assert _server.mcp.settings.port == 7343
+    assert calls == [{"transport": "streamable-http"}]

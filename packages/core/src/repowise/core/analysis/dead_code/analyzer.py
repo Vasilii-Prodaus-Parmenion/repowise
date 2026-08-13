@@ -46,6 +46,29 @@ from .jvm_reachability import build_jvm_package_files, is_jvm_file_reachable
 from .models import DeadCodeFindingData, DeadCodeKind, DeadCodeReport
 from .risk_factors import RISK_CAP_CONFIDENCE, path_risk_factors, risk_evidence
 
+#: Identifier shape, matched over raw bytes so an unindexed file never has to
+#: be decoded (these files are large by definition, and a decode would double
+#: the peak). ASCII-only is deliberate: a non-ASCII identifier that fails to
+#: match can only under-suppress.
+_IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{2,}")
+
+#: The confidence ceiling for a finding an unread file could explain is
+#: ``RISK_CAP_CONFIDENCE``, imported above rather than redefined: it already
+#: means "review candidate, never deletion-ready", it already sits exactly at
+#: the default ``min_confidence`` so the finding still surfaces, and the CLI,
+#: REST router and MCP tools already read it as the single source of truth. A
+#: lower private constant would make these findings vanish from the report,
+#: which is the wrong answer for a change whose whole premise is that silent
+#: omission is the bug.
+
+#: Read budgets for the unindexed scan. These files are skipped *because* they
+#: are large — one corpus repo ships a 104 MB generated parser — so the scan is
+#: bounded per file and in total. Tree-sitter costs ~95 MB of RSS per MB of
+#: source; this pass is a byte scan and costs far less, but the bound is what
+#: keeps it from ever becoming the expensive thing.
+_UNINDEXED_SCAN_PER_FILE_BYTES = 4 * 1024 * 1024
+_UNINDEXED_SCAN_TOTAL_BYTES = 32 * 1024 * 1024
+
 # Symbol kinds that cannot be independently imported by name in any
 # supported language. Flagging them as "unused exports" is a guaranteed
 # false-positive — they're always accessed through an enclosing class /
@@ -491,17 +514,78 @@ def _never_flag_regex(patterns: tuple[str, ...]) -> re.Pattern[str]:
     return re.compile("|".join(fnmatch.translate(os.path.normcase(p)) for p in patterns))
 
 
+@lru_cache(maxsize=8)
+def _never_flag_suffix_index(
+    patterns: tuple[str, ...],
+) -> tuple[re.Pattern[str] | None, dict[str, re.Pattern[str]], tuple[int, ...]]:
+    """Split *patterns* into suffix-keyed buckets that can be skipped wholesale.
+
+    ``_never_flag_regex`` puts all 579 patterns in one alternation, and
+    ``.match()`` tries every branch at position 0 — most of them beginning
+    ``.*``, so each branch scans the path. Measured cold on a 63k-node repo
+    that is 206 microseconds per unique path and 12.8s of an 18.1s dead-code
+    analysis, the single largest cost in the pass.
+
+    The filter is sound because ``fnmatch.translate`` ends *each* alternative
+    with ``\\Z`` and the join keeps that per-branch (``(?s:A)\\Z|(?s:B)\\Z``),
+    so every branch has to match the whole string. A pattern whose text after
+    its last ``*`` is the literal ``S`` can therefore only match a path ending
+    in ``S``: testing it against a path that does not end in ``S`` is wasted
+    work, never a dropped match. Patterns ending in ``*`` constrain nothing at
+    the tail and stay in one always-tried group.
+
+    Within a bucket the branches keep their original translated form, so the
+    atomic groups ``fnmatch`` emits for interior ``*literal`` runs — which
+    commit to the first occurrence and never retry a later one — behave
+    exactly as they did in the single alternation. Alternation order does not
+    matter to a boolean "did anything match".
+
+    Returns ``(always_tried_regex_or_None, {suffix: regex}, suffix_lengths)``.
+    """
+    always: list[str] = []
+    by_suffix: dict[str, list[str]] = {}
+    for pattern in patterns:
+        norm = os.path.normcase(pattern)
+        # No pattern in the set uses ``?`` or a character class (checked by
+        # test_never_flag_suffix_index_covers_pattern_shapes), so the text
+        # after the last ``*`` is a plain literal tail.
+        suffix = norm.rsplit("*", 1)[-1]
+        translated = fnmatch.translate(norm)
+        if suffix:
+            by_suffix.setdefault(suffix, []).append(translated)
+        else:
+            always.append(translated)
+    compiled = {s: re.compile("|".join(v)) for s, v in by_suffix.items()}
+    return (
+        re.compile("|".join(always)) if always else None,
+        compiled,
+        tuple(sorted({len(s) for s in compiled})),
+    )
+
+
 @lru_cache(maxsize=131072)
 def _never_flag_regex_match(path: str) -> bool:
-    """Memoized ``_never_flag_regex`` match for the default pattern set.
+    """Memoized never-flag match for the default pattern set.
 
-    The alternation has ~540 branches, so one match costs tens of
-    microseconds, and the detector passes ask about the same node ids
-    repeatedly (every graph node is checked by both the unreachable-files
-    and unused-exports passes). Pure function of *path*: the pattern set is
-    a module constant, so process-wide memoization is sound.
+    Equivalent to ``_never_flag_regex(_NEVER_FLAG_PATTERNS).match(...)``, and
+    pinned to it path-for-path by ``test_never_flag_regex.py``. Pure function
+    of *path*: the pattern set is a module constant, so process-wide
+    memoization is sound. The detector passes ask about the same node ids
+    repeatedly (every graph node is checked by the unreachable-files and the
+    unused-exports passes), which is what the cache is for; this function is
+    what the *first* ask of each id costs.
     """
-    return _never_flag_regex(_NEVER_FLAG_PATTERNS).match(os.path.normcase(path)) is not None
+    norm = os.path.normcase(path)
+    always, by_suffix, suffix_lengths = _never_flag_suffix_index(_NEVER_FLAG_PATTERNS)
+    if always is not None and always.match(norm):
+        return True
+    for length in suffix_lengths:
+        if length > len(norm):
+            break
+        bucket = by_suffix.get(norm[-length:])
+        if bucket is not None and bucket.match(norm):
+            return True
+    return False
 
 
 class DeadCodeAnalyzer:
@@ -515,9 +599,20 @@ class DeadCodeAnalyzer:
         git_meta_map: dict | None = None,
         parsed_files: dict | None = None,
         source_map: dict[str, bytes] | None = None,
+        repo_root: Path | None = None,
+        unindexed_source_files: list[tuple[str, str]] | None = None,
     ) -> None:
         self.graph = graph
         self.git_meta_map = git_meta_map or {}
+        # Source files ingestion could not read (currently: dropped on size).
+        # An unread importer is invisible to the graph, so "no importers" stops
+        # meaning "unused" and starts meaning "we did not look" — which is how
+        # one skipped entry point turned into 38 deletion-ready components at
+        # high confidence (#1237). ``(path, reason)`` pairs; the reason rides
+        # along so the evidence line can say why.
+        self._unindexed_source_files = list(unindexed_source_files or [])
+        self._repo_root = repo_root
+        self._unindexed_tokens: frozenset[str] | None = None
         # Four prepasses below each scan every indexed file for text markers.
         # ``source_map`` is ingestion's ``{repo_relative_path: raw bytes}`` for
         # the same file set, so passing it turns four full-repo disk passes
@@ -623,6 +718,12 @@ class DeadCodeAnalyzer:
             if on_step:
                 on_step("zombie_packages")
 
+        # Before the confidence filter, not after: a finding an unread importer
+        # could explain must be able to fall *below* min_confidence and drop
+        # out entirely, rather than being reported at a number it no longer
+        # deserves.
+        findings = self._clamp_for_unindexed_importers(findings)
+
         min_conf = cfg.get("min_confidence", 0.4)
         findings = [f for f in findings if f.confidence >= min_conf]
 
@@ -636,33 +737,6 @@ class DeadCodeAnalyzer:
         return DeadCodeReport(
             repo_id="",
             analyzed_at=now,
-            total_findings=len(findings),
-            findings=findings,
-            deletable_lines=deletable,
-            confidence_summary={"high": high, "medium": medium, "low": low},
-        )
-
-    def analyze_partial(
-        self, affected_files: list[str], config: dict | None = None
-    ) -> DeadCodeReport:
-        """Run the full detector suite, then narrow findings to ``affected_files``.
-
-        Persisted via the file-scoped ``upsert_dead_code_findings`` so unchanged
-        files keep their findings. Cross-file effects on unchanged files are not
-        recomputed here; the full ``analyze()`` remains authoritative.
-        """
-        affected_set = set(affected_files)
-        full = self.analyze(config)
-        findings = [f for f in full.findings if f.file_path in affected_set]
-
-        deletable = sum(f.lines for f in findings if f.safe_to_delete)
-        high = sum(1 for f in findings if f.confidence >= 0.7)
-        medium = sum(1 for f in findings if 0.4 <= f.confidence < 0.7)
-        low = sum(1 for f in findings if f.confidence < 0.4)
-
-        return DeadCodeReport(
-            repo_id="",
-            analyzed_at=full.analyzed_at,
             total_findings=len(findings),
             findings=findings,
             deletable_lines=deletable,
@@ -736,6 +810,84 @@ class DeadCodeAnalyzer:
             if finding:
                 findings.append(finding)
 
+        return findings
+
+    def _unindexed_identifier_tokens(self) -> frozenset[str]:
+        """Identifiers appearing in the source files ingestion never read.
+
+        Suppressing every finding whenever any file was skipped would gut the
+        feature on a repo with one vendored bundle. Reading the skipped files
+        once and asking "is this symbol even mentioned there" keeps the
+        suppression to the findings an unread importer could actually explain.
+
+        Bounded on purpose: these files are skipped *because* they are large,
+        and one corpus repo ships a 104 MB generated parser. A partial read can
+        only under-suppress (a missed mention leaves the finding as it was),
+        which is the safe direction to be wrong in.
+        """
+        if self._unindexed_tokens is not None:
+            return self._unindexed_tokens
+        if not self._unindexed_source_files or self._repo_root is None:
+            self._unindexed_tokens = frozenset()
+            return self._unindexed_tokens
+
+        tokens: set[str] = set()
+        budget = _UNINDEXED_SCAN_TOTAL_BYTES
+        for rel_path, reason in self._unindexed_source_files:
+            # A minified bundle is the one skipped file that must NOT feed this
+            # set. It is machine-packed and carries its whole dependency tree
+            # inlined, so a single 700 KB vendor bundle contributes tens of
+            # thousands of identifiers and would clamp most of the report.
+            if reason == "minified":
+                continue
+            if budget <= 0:
+                break
+            try:
+                with open(self._repo_root / rel_path, "rb") as handle:
+                    blob = handle.read(min(_UNINDEXED_SCAN_PER_FILE_BYTES, budget))
+            except OSError:
+                continue
+            budget -= len(blob)
+            # ``finditer`` rather than ``findall``: the latter materialises
+            # every match at once, roughly 500k bytes objects for a 4 MB blob.
+            tokens.update(m.group().decode("ascii", "ignore") for m in _IDENTIFIER_RE.finditer(blob))
+        self._unindexed_tokens = frozenset(tokens)
+        return self._unindexed_tokens
+
+    def _clamp_for_unindexed_importers(
+        self, findings: list[DeadCodeFindingData]
+    ) -> list[DeadCodeFindingData]:
+        """Downgrade findings an unread file could explain.
+
+        Mutates in place and returns the same list. Never raises a finding's
+        confidence and never deletes one: a reader still sees the candidate,
+        but it stops claiming to be deletion-ready on evidence we do not have.
+        """
+        if not self._unindexed_source_files:
+            return findings
+        tokens = self._unindexed_identifier_tokens()
+        if not tokens:
+            return findings
+
+        skipped_names = ", ".join(path for path, _ in self._unindexed_source_files[:3])
+        if len(self._unindexed_source_files) > 3:
+            skipped_names += f" (+{len(self._unindexed_source_files) - 3} more)"
+
+        for finding in findings:
+            # Symbol findings only. A whole-file finding would have to match on
+            # the path stem, and stems are exactly the broad words ("index",
+            # "main", "utils", "app") that ``risk_factors`` deliberately keeps
+            # out of its own token map because they cap ordinary modules. An
+            # unread importer imports symbols, so match on symbols.
+            name = finding.symbol_name
+            if not name or name not in tokens:
+                continue
+            finding.confidence = min(finding.confidence, RISK_CAP_CONFIDENCE)
+            finding.safe_to_delete = False
+            finding.evidence.append(
+                f"'{name}' appears in a source file that was not indexed "
+                f"({skipped_names}), so its importers could not be checked"
+            )
         return findings
 
     def _make_unreachable_finding(

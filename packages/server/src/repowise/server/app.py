@@ -27,7 +27,7 @@ from repowise.core.persistence.database import (
 )
 from repowise.core.persistence.models import GenerationJob
 from repowise.core.persistence.search import FullTextSearch
-from repowise.core.providers.embedding.base import MockEmbedder
+from repowise.core.providers.embedding.base import KeylessEmbedder
 from repowise.server import __version__
 from repowise.server.routers import (
     blast_radius,
@@ -39,6 +39,7 @@ from repowise.server.routers import (
     coupling,
     dead_code,
     decisions,
+    episodes,
     external_systems,
     feedback,
     files,
@@ -123,7 +124,7 @@ def _build_embedder():
     logger.warning(
         "embedder.mock_active: set REPOWISE_EMBEDDER=gemini, openai, openrouter, or ollama for real RAG"
     )
-    return MockEmbedder()
+    return KeylessEmbedder()
 
 
 @asynccontextmanager
@@ -483,6 +484,7 @@ def create_app() -> FastAPI:
     app.include_router(coupling.router)
     app.include_router(claude_md.router)
     app.include_router(decisions.router)
+    app.include_router(episodes.router)
     app.include_router(chat.router)
     app.include_router(providers.router)
     app.include_router(mcp.router)
