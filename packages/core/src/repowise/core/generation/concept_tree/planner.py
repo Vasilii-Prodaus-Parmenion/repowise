@@ -396,6 +396,16 @@ async def name_groups(
                 temperature=0.2,
                 **_reasoning_kwargs(reasoning),
             )
+        # A truncated reply parses to {} and decodes to the same deterministic
+        # fallback an empty one does, so without this the two are
+        # indistinguishable. Reasoning tokens count against the ceiling too, so
+        # a thinking model can exhaust it having emitted no answer at all.
+        if response.stop_reason == "max_tokens":
+            logger.warning(
+                "concept_outline_naming_truncated",
+                groups=len(groups),
+                provider_stop_reason=response.provider_stop_reason,
+            )
         data = parse_json_object(getattr(response, "content", "") or "")
     except Exception as exc:
         logger.warning("concept_outline_naming_failed", error=str(exc))

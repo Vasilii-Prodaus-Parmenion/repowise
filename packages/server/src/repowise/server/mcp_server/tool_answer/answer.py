@@ -53,6 +53,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from sqlalchemy import delete, select
 
@@ -114,11 +115,18 @@ from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._neighbor_rerank import (
     expand_via_neighbor_rerank as _expand_via_neighbor_rerank,
 )
+from repowise.server.mcp_server._symbol_lookup import (
+    bare_name,
+    parse_symbol_id,
+    resolve_symbol_rows,
+)
 from repowise.server.mcp_server.tool_answer.confidence import (
     _answer_is_hedged,
     _frame_term_grounding,
+    _has_unqualified_exclusivity_over_truncated,
     _is_value_question,
     _ungrounded_numbers,
+    implicated_withheld_symbols,
 )
 from repowise.server.mcp_server.tool_answer.config import (
     _AGREEMENT_RANK_GAP,
@@ -165,8 +173,11 @@ from repowise.server.mcp_server.tool_answer.symbols import (
     _extract_value_answer,
     _hydrate_candidate_defines,
     _hydrate_symbols_for_hits,
+    _read_repo_text,
     _read_symbol_source,
+    attach_truncation_contract,
     build_homonym_union_bodies,
+    is_symbol_lookup_question,
     union_defers_to_synthesis,
 )
 from repowise.server.mcp_server.tool_answer.synthesis import (
@@ -498,6 +509,177 @@ def _cache_entry_expired(created_at) -> bool:
     return (datetime.now(UTC) - ts) > timedelta(days=_ANSWER_CACHE_TTL_DAYS)
 
 
+def _cached_payload_paths(payload: dict) -> list:
+    """Every file path a cached row mentions.
+
+    Read twice: once to decide whether the row references a path that has since
+    been excluded, and once as the ``_meta`` targets of the served reply.
+    """
+    return [
+        *(payload.get("citations") or []),
+        *(payload.get("fallback_targets") or []),
+        # "path" is the serialized key; "target_path" survives in rows cached
+        # before the clean retrieval view existed.
+        *(h.get("path") or h.get("target_path") for h in (payload.get("retrieval") or [])),
+        *(g.get("file") for g in (payload.get("best_guesses") or [])),
+    ]
+
+
+def _cache_bypass_reason(
+    payload: dict, created_at, repository, exclude_spec, cached_paths: list
+) -> str | None:
+    """Why this cached row must not be served, or None when it is good to serve.
+
+    Each reason is logged where it is decided, with its own values, so the log
+    says why a caller got a fresh synthesis rather than merely that it did.
+
+    * schema: payloads from a pre-rework code path do not carry the fields the
+      current consumer expects. Serving them masks every later improvement until
+      the row happens to expire, so bypass silently and let the next write
+      upgrade the row.
+    * hedged: the retrieval and symbol pipeline has been upgraded since, so give
+      synthesis another shot with the new context rather than pinning a bad
+      answer.
+    * empty: older versions cached gated empty-answer payloads, which pinned a
+      retrieval miss until TTL. The write side no longer does this; the check
+      retires the rows that predate the fix.
+    * excluded: a row cached before ``exclude_patterns`` changed may reference a
+      now-excluded file in its fields or in its prose. Re-synthesize rather than
+      scrub the fields and leave the prose dangling.
+    * commit / TTL: a row synthesised against a previous index may cite moved
+      code or stale values. The TTL covers pre-stamping rows and gitless repos,
+      where there is no commit to compare.
+    """
+    cached_version = payload.get("_schema_version", 1)
+    if cached_version < _ANSWER_SCHEMA_VERSION:
+        _log.info(
+            "Bypassing cache entry at schema v%s (current v%s)",
+            cached_version,
+            _ANSWER_SCHEMA_VERSION,
+        )
+        return "schema"
+    if _answer_is_hedged(payload.get("answer", "")):
+        _log.info("Bypassing hedged cache entry for re-synthesis")
+        return "hedged"
+    if not (payload.get("answer") or "").strip():
+        _log.info("Bypassing cached empty-answer (gated) entry")
+        return "empty"
+    if any(is_excluded(p, exclude_spec) for p in cached_paths):
+        _log.info("Bypassing cache entry referencing a now-excluded path")
+        return "excluded"
+    current_commit = getattr(repository, "head_commit", None)
+    cached_commit = payload.get("_indexed_commit")
+    if cached_commit and current_commit and cached_commit != current_commit:
+        _log.info(
+            "Bypassing cache entry from commit %s (repo now at %s)",
+            cached_commit,
+            current_commit,
+        )
+        return "stale-commit"
+    if _cache_entry_expired(created_at):
+        _log.info("Bypassing cache entry past the %d-day TTL", _ANSWER_CACHE_TTL_DAYS)
+        return "expired"
+    return None
+
+
+async def _serve_cached_answer(
+    *, ctx, question: str, repository, repo_id, qhash: str, exclude_spec, t0: float
+) -> dict | None:
+    """The cached answer for this question, or None to synthesize a fresh one.
+
+    None covers every reason a row must not be served: no row at all, a row
+    :func:`_cache_bypass_reason` rejects, and any failure reading one. A row
+    that will not parse is not a reason to fail the call; the next write
+    replaces it.
+    """
+    async with get_session(ctx.session_factory) as session:
+        res = await session.execute(
+            select(AnswerCache).where(
+                AnswerCache.repository_id == repo_id,
+                AnswerCache.question_hash == qhash,
+            )
+        )
+        cached = res.scalar_one_or_none()
+    if cached is None:
+        return None
+    with contextlib.suppress(Exception):
+        payload = _json.loads(cached.payload_json)
+        cached_paths = _cached_payload_paths(payload)
+        if _cache_bypass_reason(
+            payload, cached.created_at, repository, exclude_spec, cached_paths
+        ):
+            return None
+        # Cache-internal fields never reach the consumer (response keys must not
+        # start with "_" except _meta).
+        payload.pop("_indexed_commit", None)
+        payload.pop("_schema_version", None)
+        payload["_meta"] = _build_meta(
+            timing_ms=(time.perf_counter() - t0) * 1000,
+            cached=True,
+            hint=_answer_hint(
+                payload.get("confidence", "low"),
+                len(payload.get("retrieval", [])),
+            ),
+            repository=repository,
+            targets=[p for p in cached_paths if isinstance(p, str) and p],
+        )
+        _apply_lean_high(payload, question)
+        _trim_served_payload(payload)
+        # Serve-time, on this path as well as the fresh one: the episode is read
+        # on every call and never cached into an answer, so a disagreement
+        # cannot be frozen into a row and served after it has been superseded.
+        await _attach_episode(
+            payload,
+            question=question,
+            repo_path=getattr(ctx, "path", None),
+            repo_name=getattr(repository, "name", None),
+        )
+        return payload
+    return None
+
+
+async def _write_answer_cache(
+    payload: dict, *, ctx, question: str, repository, repo_id, qhash: str, provider
+) -> None:
+    """Persist this answer as the cache row for the question (upsert).
+
+    Best-effort: a cache failure must never block the response, but it must be
+    LOGGED rather than suppressed. A plain INSERT under a blanket suppress
+    violated ``uq_answer_cache_q`` on every bypass-and-resynthesize round and
+    failed silently, so hedged and stale rows were never upgraded.
+    Delete-then-insert in one transaction is the dialect-agnostic upsert, and
+    the stamped ``_indexed_commit`` is what the read-side freshness check reads.
+
+    The row is a shallow copy taken here, so anything the caller attaches to the
+    payload after this point reaches the caller and never the cache.
+    """
+    cache_payload = dict(payload)
+    cache_payload["_schema_version"] = _ANSWER_SCHEMA_VERSION
+    commit_now = getattr(repository, "head_commit", None)
+    if commit_now:
+        cache_payload["_indexed_commit"] = commit_now
+    try:
+        async with get_session(ctx.session_factory) as session:
+            await session.execute(
+                delete(AnswerCache).where(
+                    AnswerCache.repository_id == repo_id,
+                    AnswerCache.question_hash == qhash,
+                )
+            )
+            row = AnswerCache(
+                repository_id=repo_id,
+                question_hash=qhash,
+                question=question.strip(),
+                payload_json=_json.dumps(cache_payload, default=_json_default),
+                provider_name=getattr(provider, "provider_name", "") or "",
+                model_name=getattr(provider, "model_name", "") or "",
+            )
+            session.add(row)
+            await session.commit()
+    except Exception as exc:
+        _log.warning("get_answer cache write failed: %s", exc)
+
+
 def _is_readable_path(target: str) -> bool:
     """Whether a fallback_target is a file the agent can actually Read.
 
@@ -517,6 +699,94 @@ def _is_readable_path(target: str) -> bool:
     return bool(ext) and ext.isalnum() and len(ext) <= 6
 
 
+def _repo_root(ctx) -> Path | None:
+    """The checkout root as a Path, or None when the context carries no path.
+
+    Every live source read in this module is anchored on it, and a context
+    without a path is the repo-less case those reads must skip rather than
+    guess at.
+    """
+    return Path(str(ctx.path)) if getattr(ctx, "path", None) else None
+
+
+def _top_two_score_ratio(hits: list[dict]) -> float:
+    """The top hit's retrieval score over the runner-up's.
+
+    The separator both the confidence grade and :func:`_retrieval_quality` are
+    built on, kept in one place because they must agree on what "dominant"
+    measures. A lone hit has nothing to be ambiguous against, so it is infinitely
+    dominant; no hits at all is zero.
+    """
+    if len(hits) >= 2:
+        return hits[0].get("score", 0.0) / (hits[1].get("score", 0.0) or 1e-9)
+    return float("inf") if hits else 0.0
+
+
+async def _first_resolvable_id(
+    ids: list[str], ctx, repository, exclude_spec
+) -> str | None:
+    """The first id ``get_symbol`` would actually answer, or None if none would.
+
+    The note and ``next_action_hint`` below interpolate a ``symbol_id`` straight
+    out of the scanner. The scanner is a regex over source lines, so it can name
+    something that is not a symbol, and an answer must never advertise a next
+    action that dead-ends.
+
+    ``get_symbol`` has THREE outcomes and only one of them is a failure: an
+    indexed row, a live-grep fallback when the name is in the file but not the
+    index, and nothing at all. Treating the live-grep case as unresolvable is a
+    mistake already made once while measuring this — it read mui as "90%
+    unresolvable" when the truth was "90% no index row, all still usable" — so
+    the live-grep outcome counts as resolved here too.
+
+    Deliberately conservative in the other direction: an id whose file cannot be
+    read is KEPT, because an unreadable file is absence of evidence, not
+    evidence the id is fabricated. Only a positive read that does not contain
+    the name, with no index row either, disqualifies one.
+    """
+    repo_root = _repo_root(ctx)
+    for sid in ids:
+        file_part, name_part = parse_symbol_id(sid)
+        if not file_part or not name_part:
+            continue
+        if is_excluded(file_part, exclude_spec):
+            # get_symbol refuses excluded paths outright, index row or not.
+            continue
+        text = _read_repo_text(repo_root, file_part)
+        if text is None or bare_name(name_part) in text:
+            return sid
+        # The name is provably absent from the live file, so the live-grep leg
+        # cannot fire. An indexed row is the only way get_symbol still answers.
+        with contextlib.suppress(Exception):
+            async with get_session(ctx.session_factory) as session:
+                if await resolve_symbol_rows(session, repository.id, sid):
+                    return sid
+    return None
+
+
+def _rationale_anchors(h: dict) -> list[tuple[str, int | None]]:
+    """One ``(path, near-line)`` pair per reason this hit is worth scanning.
+
+    A concept-anchored file leads: it was selected precisely because its comment
+    explains the question, and the grep match line is the best near-line boost
+    available. Each anchored or question-matched symbol then contributes the
+    same path again at its own definition line, so a file with several matches
+    is repeated as many times as it has reasons, which is the weighting the
+    scan below orders on.
+    """
+    path = h.get("target_path")
+    if not path:
+        return []
+    anchors: list[tuple[str, int | None]] = []
+    if h.get("_concept_anchored"):
+        anchors.append((path, h.get("_concept_near_line")))
+    for s in (h.get("_anchor_symbols") or []) + [
+        s for s in (h.get("symbols") or []) if s.get("_matched")
+    ]:
+        anchors.append((path, s.get("start_line")))
+    return anchors
+
+
 def _gather_code_rationale(ctx, hits: list[dict], fallback_targets: list[str], question: str):
     """Mine in-code rationale comments for a low-confidence answer.
 
@@ -533,24 +803,11 @@ def _gather_code_rationale(ctx, hits: list[dict], fallback_targets: list[str], q
     candidates: list[str] = []
     near_lines: dict[str, int] = {}
     for h in hits or []:
-        path = h.get("target_path")
-        if not path:
-            continue
-        # A concept-anchored file leads: it was selected precisely because its
-        # comment explains the question, and the grep match line is the best
-        # near-line boost we have.
-        if h.get("_concept_anchored"):
+        for path, near_line in _rationale_anchors(h):
             candidates.append(path)
-            cl = h.get("_concept_near_line")
-            if cl and path not in near_lines:
-                near_lines[path] = cl
-        for s in (h.get("_anchor_symbols") or []) + [
-            s for s in (h.get("symbols") or []) if s.get("_matched")
-        ]:
-            candidates.append(path)
-            sl = s.get("start_line")
-            if sl and path not in near_lines:
-                near_lines[path] = sl
+            # First mention of a path wins its near-line boost.
+            if near_line and path not in near_lines:
+                near_lines[path] = near_line
     candidates.extend(p for p in (fallback_targets or []) if p)
     try:
         return _mine_rationale(repo_root, candidates, question, near_lines=near_lines)
@@ -568,32 +825,35 @@ def _drop_already_surfaced(rationale: list[dict], *surfaced: list[dict]) -> list
     drop any mined comment whose ``(path, line-range)`` overlaps an entry already
     surfaced. Entries without a ``(path, lines)`` pair are ignored.
     """
-    occupied: list[tuple[str, int, int]] = []
-    for entries in surfaced:
-        for e in entries or []:
-            path = e.get("path")
-            lines = e.get("lines")
-            if path and isinstance(lines, (list, tuple)) and len(lines) == 2:
-                occupied.append((path, lines[0], lines[1]))
+    occupied = [span for entries in surfaced for span in map(_line_span, entries or []) if span]
     if not occupied:
         return rationale
-    kept: list[dict] = []
-    for r in rationale:
-        path = r.get("path")
-        lines = r.get("lines")
-        if (
-            path
-            and isinstance(lines, (list, tuple))
-            and len(lines) == 2
-            and any(p == path and not (lines[1] < s or lines[0] > e) for p, s, e in occupied)
-        ):
-            continue
-        kept.append(r)
-    return kept
+    return [r for r in rationale if not _overlaps_any(_line_span(r), occupied)]
+
+
+def _line_span(entry: dict) -> tuple[str, int, int] | None:
+    """The ``(path, start, end)`` an entry occupies, or None if it names none.
+
+    Entries without a usable ``(path, lines)`` pair cannot be compared for
+    overlap in either direction, so they neither occupy space nor get dropped.
+    """
+    path = entry.get("path")
+    lines = entry.get("lines")
+    if path and isinstance(lines, (list, tuple)) and len(lines) == 2:
+        return (path, lines[0], lines[1])
+    return None
+
+
+def _overlaps_any(span: tuple[str, int, int] | None, occupied: list[tuple[str, int, int]]) -> bool:
+    """Whether ``span`` shares a file and any line with something already shown."""
+    if span is None:
+        return False
+    path, start, end = span
+    return any(p == path and not (end < s or start > e) for p, s, e in occupied)
 
 
 def _gather_body_candidates(
-    hits: list[dict], answer_text: str
+    hits: list[dict], answer_text: str, *, anchor_names: set[str] | None = None
 ) -> list[tuple[int, int, int, str, dict]]:
     """Rank the definitions to inline in ``symbol_bodies``, most-relevant first.
 
@@ -608,6 +868,15 @@ def _gather_body_candidates(
     extract_all method of DecisionExtractor" serves extract_all, not the
     1,300-line class head), then document order. Only definitions the answer
     text actually names qualify; constants stay in ``quotes``.
+
+    ``anchor_names`` switches tier 0 off the prose and onto the identifiers the
+    QUESTION named: the degraded path, where there is no synthesised text to
+    match against. Selection was the only thing coupling ``symbol_bodies`` to
+    synthesis: the bodies themselves are read live off disk from index anchors,
+    and tier 0's input (``_anchor_symbols``) is driven by
+    ``_extract_question_identifiers`` off the question, so it is fully determined
+    before synthesis would have run. Tier 1 is skipped in this mode by
+    construction, since it exists to catch a symbol only the prose names.
     """
     candidates: list[tuple[int, int, int, str, dict]] = []
     for h in hits[:_ENRICH_TOP_N_HITS]:
@@ -615,25 +884,222 @@ def _gather_body_candidates(
         if not path:
             continue
         for s in h.get("_anchor_symbols") or []:
-            name = s.get("name")
-            if not name or name not in answer_text:
-                continue
-            kind = s.get("kind")
-            kind_rank = 0 if kind in ("function", "method") else 1
-            candidates.append((0, kind_rank, s.get("start_line") or 0, path, s))
+            if _selection_names(s.get("name"), answer_text, anchor_names):
+                candidates.append((0, _kind_rank(s), s.get("start_line") or 0, path, s))
+        # Tier 1 exists to catch a symbol only the PROSE names, so it has
+        # nothing to do in the degraded mode that has no prose.
+        if anchor_names is not None:
+            continue
         for s in h.get("symbols") or []:
-            name = s.get("name")
-            if not name or len(name) < 3 or not s.get("_matched"):
-                continue
-            if name not in answer_text:
-                continue
-            kind = s.get("kind")
-            if kind not in ("function", "method", "class", "interface"):
-                continue
-            kind_rank = 0 if kind in ("function", "method") else 1
-            candidates.append((1, kind_rank, s.get("start_line") or 0, path, s))
+            if _is_named_definition(s, answer_text):
+                candidates.append((1, _kind_rank(s), s.get("start_line") or 0, path, s))
     candidates.sort(key=lambda t: (t[0], t[1], t[2]))
     return candidates
+
+
+def _selection_names(name: str | None, answer_text: str, anchor_names: set[str] | None) -> bool:
+    """Whether the text that selects bodies names this symbol.
+
+    Two selection texts, one predicate: normally the synthesised answer decides
+    which definitions are worth inlining, but the degraded path has no prose, so
+    ``anchor_names`` puts the question's own identifiers in its place. Note the
+    difference in kind: ``anchor_names`` is an exact set membership, the answer
+    text a substring match.
+    """
+    if not name:
+        return False
+    return name in anchor_names if anchor_names is not None else name in answer_text
+
+
+def _kind_rank(s: dict) -> int:
+    """0 for a callable, 1 for a container.
+
+    Within a tier a function or method outranks the class that holds it, so
+    "explain the extract_all method of DecisionExtractor" serves extract_all
+    rather than the 1,300-line class head.
+    """
+    return 0 if s.get("kind") in ("function", "method") else 1
+
+
+def _is_named_definition(s: dict, answer_text: str) -> bool:
+    """Whether a hydrated symbol is a definition the answer actually names.
+
+    Requires a name long enough that substring containment means something (a
+    1-2 character constant would "appear" in almost any answer), the
+    question-match the hydrator recorded, and a kind that has a body worth
+    inlining. Constants stay in ``quotes``: their body IS the assignment line.
+    """
+    name = s.get("name")
+    if not name or len(name) < 3 or not s.get("_matched"):
+        return False
+    if name not in answer_text:
+        return False
+    return s.get("kind") in ("function", "method", "class", "interface")
+
+
+def _retrieval_quality(hits: list[dict], agreement_dominant: bool) -> str:
+    """Rate the retrieval, independently of the text it fed.
+
+    Where ``confidence`` says "how much should you trust the synthesised text",
+    this says "how good was the retrieval that fed it". The agent reads
+    confidence to decide whether to re-read, and this to decide whether to call
+    search_codebase again with a refined query.
+
+    Kept as one function because the degraded path needs the same rating and must
+    not invent a second one. That path has no synthesised text to rate (its
+    ``confidence`` stays low, correctly), but it ran exactly the same retrieval,
+    and "high" has to mean the same thing to a keyless caller as to a keyed one
+    or the field is worth less than nothing.
+    """
+    ratio = _top_two_score_ratio(hits)
+    top_score = hits[0].get("score", 0.0) if hits else 0.0
+    dominant_grade = ratio >= _DOMINANCE_RATIO or agreement_dominant
+    if dominant_grade and top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR:
+        return "high"
+    return "partial" if dominant_grade else "weak"
+
+
+def _build_symbol_bodies(
+    body_candidates: list[tuple[int, int, int, str, dict]], repo_root: Path | None
+) -> tuple[list[dict], bool]:
+    """Inline the ranked definitions as live source, with the truncation contract.
+
+    Returns ``(symbol_bodies, served_named_body)``. ``served_named_body`` is True
+    once a tier-0 body (the exact symbol the question named) is inlined; the
+    confidence gates read it to avoid the "low, go Read" label on a payload that
+    already holds the answer.
+
+    Every step here is prose-independent: the body is re-read live from disk at
+    the indexed bounds, and when the indexed body outruns the line cap a
+    ``continuation`` names the exact range read for the remainder plus the
+    ``withheld_symbols`` it covers. That is why the degraded path can call this
+    too. The only thing it lacks is the answer text that selects the candidates,
+    which ``_gather_body_candidates(anchor_names=...)`` supplies instead.
+    """
+    symbol_bodies: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    served_named_body = False
+    for tier, _kind_rank, start, path, s in body_candidates:
+        if len(symbol_bodies) >= _INLINE_BODY_MAX_SYMBOLS:
+            break
+        name = s["name"]
+        if (path, name) in seen:
+            continue
+        sym_end = s.get("end_line") or 0
+        # Re-read a fuller body than the synthesis excerpt: this block is for
+        # the agent, so a docstring-heavy def shouldn't spend its whole window
+        # on docstring and truncate the logic the question asked about. Falls
+        # back to the hydrator's excerpt if the re-read fails.
+        body = _read_symbol_source(
+            repo_root, path, start, sym_end, max_lines=_INLINE_BODY_MAX_LINES
+        ) or s.get("source_excerpt")
+        if not body:
+            continue
+        served = body.count("\n") + 1
+        end_served = start + served - 1
+        sym_end = sym_end or end_served
+        entry: dict = {
+            "path": path,
+            "name": name,
+            "lines": [start, end_served],
+            "source": body,
+        }
+        attach_truncation_contract(
+            entry, indexed_end=sym_end, end_served=end_served, repo_root=repo_root
+        )
+        symbol_bodies.append(entry)
+        seen.add((path, name))
+        if tier == 0:
+            served_named_body = True
+    return symbol_bodies, served_named_body
+
+
+def _data_shape_prose(grounded: dict, citations: list[str]) -> tuple[str, str]:
+    """The ``answer`` and ``note`` for a mined data shape, by how it was grounded.
+
+    A documented shape is authoritative and says so (cite it, no verification
+    Read). A usage-mined shape is the keys consumers actually pull off the value,
+    which may be a subset of what is stored, so it asks to be verified.
+    """
+    ident = grounded["identifier"]
+    fields = grounded["fields"]
+    sources = grounded["sources"]
+    also_accessed = grounded.get("also_accessed") or []
+    field_list = ", ".join(f"`{f}`" for f in fields)
+
+    if grounded["grounding"] != "docstring":
+        first = sources[0]
+        return (
+            f"Each entry in `{ident}` is accessed with {len(fields)} key(s): "
+            f"{field_list}. These are the keys consumers actually pull off the "
+            f"parsed value (e.g. {first['file']}:{first['line']}); this is mined "
+            "from usage, not a declared schema, so verify if you need the full set.",
+            "Grounded in the key accesses mined from consumer source (no "
+            "documented shape was found). Medium confidence: these are the keys "
+            "the code reads, which may be a subset of the stored fields.",
+        )
+
+    doc_src = next((s for s in sources if s["kind"] == "docstring"), None)
+    where = f"{doc_src['file']}:{doc_src['line']}" if doc_src else citations[0]
+    if not also_accessed:
+        return (
+            f"Each entry in `{ident}` has {len(fields)} field(s): {field_list}. "
+            f"This is the documented shape at {where}; cite it directly, no "
+            "verification Read needed.",
+            "Grounded in the documented field shape mined from source (the "
+            "quoted keys in the docstring/comment at the cited line). "
+            "data_shape.sources lists every field's origin line.",
+        )
+
+    # The doc lists the declared shape, but consumers read alias key(s) it omits
+    # (a legacy fallback). Surface them: telling the agent "no Read needed" while
+    # hiding a key it must handle would be a confidently-incomplete answer.
+    alias_list = ", ".join(f"`{a['field']}`" for a in also_accessed)
+    first_alias = also_accessed[0]
+    return (
+        f"Each entry in `{ident}` has {len(fields)} documented field(s): "
+        f"{field_list} (documented shape at {where}). Consumers also read "
+        f"{alias_list} as a fallback (e.g. {first_alias['file']}:"
+        f"{first_alias['line']}) - an alias the docstring omits, so handle "
+        f"{alias_list} too if you touch this.",
+        "Grounded in the documented field shape, plus alias key(s) "
+        "consumers read beside a documented field that the docstring "
+        "omits (see data_shape.also_accessed). The documented fields are "
+        "authoritative; the aliases are real keys the code defends against.",
+    )
+
+
+def _is_question_named_body_cut_by_us(entry: dict, question_ids: set[str]) -> bool:
+    """Whether this body is the question's own symbol, cut because WE ran out of lines.
+
+    ``truncated`` alone is not trustworthy enough to demote on. It is set by
+    comparing the INDEXED end line against what was read, while the read clamps
+    to the end of the live file, so a symbol whose stored end overshoots (an
+    unsupported language or a syntax error leaves the bounds unverified, and a
+    file that shrank since indexing does it too) is served WHOLE and still
+    flagged. Requiring the served span to have reached the line cap says the cut
+    was ours, which is the only case where something was really withheld.
+    """
+    if not (entry.get("truncated") and entry.get("continuation")):
+        return False
+    if entry.get("name") not in question_ids:
+        return False
+    return entry["lines"][1] - entry["lines"][0] + 1 >= _INLINE_BODY_MAX_LINES
+
+
+def _is_enclosing_continuation(entry: dict, implicated: set[str]) -> bool:
+    """Whether this body simply continues past the cut, rather than losing a symbol.
+
+    A withheld entry carrying the served body's OWN name is the enclosing symbol
+    continuing past the cut, not something that never arrived. Calling that "not
+    served" is wrong about the payload directly above the note, and sends the
+    caller to get_symbol for a body they already hold most of. The accurate
+    pointer is the ``continuation`` the entry already carries.
+    """
+    name = entry.get("name")
+    if not (entry.get("continuation") and name in implicated):
+        return False
+    return any(s.get("name") == name for s in (entry.get("withheld_symbols") or []))
 
 
 def _build_data_shape_payload(grounded: dict, t0: float, repository) -> dict:
@@ -648,54 +1114,7 @@ def _build_data_shape_payload(grounded: dict, t0: float, repository) -> dict:
     sources = grounded["sources"]
     also_accessed = grounded.get("also_accessed") or []
     citations = sorted({s["file"] for s in sources})
-    field_list = ", ".join(f"`{f}`" for f in fields)
-    doc_src = next((s for s in sources if s["kind"] == "docstring"), None)
-    if grounded["grounding"] == "docstring":
-        where = f"{doc_src['file']}:{doc_src['line']}" if doc_src else citations[0]
-        if also_accessed:
-            # The doc lists the declared shape, but consumers read alias key(s)
-            # it omits (a legacy fallback). Surface them: telling the agent "no
-            # Read needed" while hiding a key it must handle would be a
-            # confidently-incomplete answer.
-            alias_list = ", ".join(f"`{a['field']}`" for a in also_accessed)
-            first_alias = also_accessed[0]
-            answer = (
-                f"Each entry in `{ident}` has {len(fields)} documented field(s): "
-                f"{field_list} (documented shape at {where}). Consumers also read "
-                f"{alias_list} as a fallback (e.g. {first_alias['file']}:"
-                f"{first_alias['line']}) - an alias the docstring omits, so handle "
-                f"{alias_list} too if you touch this."
-            )
-            note = (
-                "Grounded in the documented field shape, plus alias key(s) "
-                "consumers read beside a documented field that the docstring "
-                "omits (see data_shape.also_accessed). The documented fields are "
-                "authoritative; the aliases are real keys the code defends against."
-            )
-        else:
-            answer = (
-                f"Each entry in `{ident}` has {len(fields)} field(s): {field_list}. "
-                f"This is the documented shape at {where}; cite it directly, no "
-                "verification Read needed."
-            )
-            note = (
-                "Grounded in the documented field shape mined from source (the "
-                "quoted keys in the docstring/comment at the cited line). "
-                "data_shape.sources lists every field's origin line."
-            )
-    else:
-        first = sources[0]
-        answer = (
-            f"Each entry in `{ident}` is accessed with {len(fields)} key(s): "
-            f"{field_list}. These are the keys consumers actually pull off the "
-            f"parsed value (e.g. {first['file']}:{first['line']}); this is mined "
-            "from usage, not a declared schema, so verify if you need the full set."
-        )
-        note = (
-            "Grounded in the key accesses mined from consumer source (no "
-            "documented shape was found). Medium confidence: these are the keys "
-            "the code reads, which may be a subset of the stored fields."
-        )
+    answer, note = _data_shape_prose(grounded, citations)
     payload: dict = {
         "answer": answer,
         "citations": citations,
@@ -718,6 +1137,34 @@ def _build_data_shape_payload(grounded: dict, t0: float, repository) -> dict:
         ),
     }
     return payload
+
+
+def _no_answer_payload(note: str, *, repository, t0: float) -> dict:
+    """The reply for a post-retrieval gate that has nothing to answer with.
+
+    Two gates end this way and both mean the same thing: retrieval ran, and the
+    honest reply is "not this" plus what to do instead. The qualified-miss guard
+    refuses to substitute a same-named symbol from another file; the no-hits
+    guard has no candidates at all. ``note`` is the only part that differs, and
+    it carries the redirect.
+
+    Both callers still wrap this in :func:`_with_candidates`, which is what keeps
+    the ranked shortlist travelling with every post-retrieval return.
+    """
+    return {
+        "answer": "",
+        "citations": [],
+        "confidence": "low",
+        "note": note,
+        "fallback_targets": [],
+        "retrieval": [],
+        "_meta": _build_meta(
+            timing_ms=(time.perf_counter() - t0) * 1000,
+            hint=_answer_hint("low", 0),
+            repository=repository,
+            targets=[],
+        ),
+    }
 
 
 def _with_candidates(payload: dict, resolved_pool: list[dict]) -> dict:
@@ -751,7 +1198,44 @@ def _with_candidates(payload: dict, resolved_pool: list[dict]) -> dict:
     return payload
 
 
-def _degraded_payload(
+def _degraded_summary(reason: str, symbol_bodies: list[dict], served: int) -> str:
+    """The ``answer`` sentence a synthesis-less payload states about itself.
+
+    Assembled from what the payload actually carries, so it can never claim more
+    than it has, and it invents no prose about the question itself, that being
+    precisely the part that needs a provider. Three cases, best evidence first:
+    bodies in hand, a ranked retrieval, or nothing.
+    """
+    if symbol_bodies:
+        names = ", ".join(f"`{b['name']}`" for b in symbol_bodies)
+        # Never say "full" over a body the payload itself flags as cut. The
+        # entry carries `truncated` and a `continuation` two keys away, so the
+        # claim is refutable from inside the same response.
+        cut = any(b.get("truncated") for b in symbol_bodies)
+        return (
+            f"No synthesized prose ({reason}), but the evidence is here: "
+            f"`symbol_bodies` carries the live source of {names}, read from the "
+            "current checkout"
+            + (", cut at the line cap where noted; see `continuation`. " if cut else " in full. ")
+            + "Answer from that; `retrieval`, `fallback_targets` and `candidates` "
+            "cover the wider question."
+        )
+    if served:
+        return (
+            f"No synthesized prose ({reason}), but retrieval succeeded and this "
+            f"payload is usable: {served} ranked "
+            f"{'hit' if served == 1 else 'hits'} in `retrieval`, the files to open "
+            "in `fallback_targets`, and the wider ranked shortlist in `candidates`. "
+            "Read those rather than starting a fresh search."
+        )
+    return (
+        f"No synthesized prose ({reason}), and retrieval matched nothing for "
+        "this question. Rephrase with an identifier or path from the codebase, "
+        "or search directly."
+    )
+
+
+async def _degraded_payload(
     *,
     reason: str,
     note: str,
@@ -759,6 +1243,10 @@ def _degraded_payload(
     fallback_targets: list[str],
     repository,
     t0: float,
+    ctx=None,
+    question_ids: set[str] | None = None,
+    exclude_spec=None,
+    agreement_dominant: bool = False,
     resolved_pool: list[dict] | None = None,
 ) -> dict:
     """Shape a synthesis-less get_answer response.
@@ -779,221 +1267,149 @@ def _degraded_payload(
     carries, so it can never claim more than it has, and no prose about the
     question itself is invented, that being precisely the part that needs a
     provider.
-    """
-    served = len(hits)
-    if served:
-        summary = (
-            f"No synthesized prose ({reason}), but retrieval succeeded and this "
-            f"payload is usable: {served} ranked "
-            f"{'hit' if served == 1 else 'hits'} in `retrieval`, the files to open "
-            "in `fallback_targets`, and the wider ranked shortlist in `candidates`. "
-            "Read those rather than starting a fresh search."
-        )
-    else:
-        summary = (
-            f"No synthesized prose ({reason}), and retrieval matched nothing for "
-            "this question. Rephrase with an identifier or path from the codebase, "
-            "or search directly."
-        )
 
-    return _with_candidates(
-        {
-            "answer": summary,
-            "citations": [],
-            "confidence": "low",
-            "degraded": reason,
-            "fallback_targets": fallback_targets,
-            "retrieval": _serialize_hits(hits),
-            "note": note,
-            "_meta": {
-                **_build_meta(
-                    timing_ms=(time.perf_counter() - t0) * 1000,
-                    hint=_answer_hint("low", len(hits)),
-                    repository=repository,
-                    targets=fallback_targets,
-                ),
-                "degraded": reason,
-            },
-        },
-        resolved_pool if resolved_pool is not None else hits,
+    The evidence beside the prose is built here too. Everything below the
+    provider check in ``get_answer`` (bodies, citations, the next action) is
+    read live off disk from index anchors and needs no LLM; the only thing that
+    coupled it to synthesis was that ``_gather_body_candidates`` selects against
+    the answer text. Measured on the keyless arm (26 paired questions, flask +
+    django, 2026-08-13) that cost 9 of 26 questions the very body the keyed arm
+    served: a caller asking for ``Flask`` got three paths where the keyed arm got
+    ``src/flask/app.py`` 105-225. Selecting tier 0 against the question's own
+    identifiers instead recovers it, and an agent handed the body of the symbol
+    it asked about answers from the tool rather than leaving it to Read.
+
+    ``confidence`` stays "low" and is not up for debate: it rates the synthesised
+    text, and here that text is assembled boilerplate, byte-identical on 24 of
+    the 26 measured questions. An agent told to cite it would cite that sentence.
+    What was missing is ``retrieval_quality``, which rates the retrieval instead
+    and was simply never set: 26 of 26 keyless payloads carried no such key, so
+    the only trust signal a caller had was a "low" about something it should not
+    have been trusting anyway, and 11 of them said it while rank 1 was a file the
+    keyed arm went on to cite. The same rule the synthesised path uses answers
+    that question here, and it stays honest in the other direction: 14 of the 26
+    retrievals were genuinely weak in both arms and still grade "weak".
+    """
+    retrieval_quality = _retrieval_quality(hits, agreement_dominant)
+    repo_root = _repo_root(ctx)
+    symbol_bodies, _served_named_body = _build_symbol_bodies(
+        _gather_body_candidates(hits, "", anchor_names=question_ids or set()),
+        repo_root,
+    )
+    # Cite what is actually in hand. `[]` was right when the payload carried no
+    # source; with bodies inlined the paths they were read from are citations in
+    # the ordinary sense, and a caller filtering on non-empty `citations` stops
+    # discarding this reply.
+    citations = list(dict.fromkeys(b["path"] for b in symbol_bodies))
+
+    summary = _degraded_summary(reason, symbol_bodies, len(hits))
+
+    payload: dict = {
+        "answer": summary,
+        "citations": citations,
+        "confidence": "low",
+        "retrieval_quality": retrieval_quality,
+        "degraded": reason,
+        "fallback_targets": fallback_targets,
+        "retrieval": _serialize_hits(hits),
+        "note": note,
+    }
+    if symbol_bodies:
+        payload["symbol_bodies"] = symbol_bodies
+        payload["grounding"] = "symbol_body"
+        payload["next_action_hint"] = await _degraded_next_action(
+            symbol_bodies, ctx, repository, exclude_spec
+        )
+        payload["note"] += (
+            " symbol_bodies carries the live body of the symbol(s) you named, so "
+            "answer from that rather than re-reading the file."
+        )
+    payload["_meta"] = {
+        **_build_meta(
+            timing_ms=(time.perf_counter() - t0) * 1000,
+            hint=_answer_hint(
+                "low",
+                len(hits),
+                degraded=reason,
+                retrieval_quality=retrieval_quality,
+                has_bodies=bool(symbol_bodies),
+            ),
+            repository=repository,
+            targets=[*citations, *fallback_targets],
+        ),
+        "degraded": reason,
+    }
+    return _with_candidates(payload, resolved_pool if resolved_pool is not None else hits)
+
+
+async def _degraded_next_action(
+    symbol_bodies: list[dict], ctx, repository, exclude_spec
+) -> str:
+    """The one next step a degraded payload with bodies in hand should name.
+
+    A whole body is a terminal answer, so say so rather than sending the caller
+    to Read a file it already holds. A cut body is not: name the continuation, or
+    a withheld symbol when one resolves.
+
+    Two filters on the withheld ids, both already established on the synthesised
+    path. A withheld entry carrying the served body's OWN name is the enclosing
+    symbol continuing past the cut, not something that never arrived, so it is
+    dropped and the ``continuation``, which fetches exactly the missing part,
+    is the pointer. And the ids come from a regex scanner over source lines, so
+    it can name something that is not a symbol at all: ``_first_resolvable_id``
+    keeps a fabricated id from becoming the next action here exactly as it does
+    there.
+    """
+    cut = next((b for b in symbol_bodies if b.get("continuation")), None)
+    if cut is None:
+        return (
+            f"Read the {symbol_bodies[0]['name']} body in symbol_bodies: it is the "
+            "full live source, so no follow-up call is needed."
+        )
+    hint_id = await _first_resolvable_id(
+        [
+            s["symbol_id"]
+            for s in (cut.get("withheld_symbols") or [])
+            if s.get("symbol_id") and s.get("name") != cut["name"]
+        ],
+        ctx,
+        repository,
+        exclude_spec,
+    )
+    return (
+        f"{cut['name']} was served through line {cut['lines'][1]}; call get_symbol "
+        + (
+            f"id='{hint_id}' for the withheld body."
+            if hint_id
+            else f"id='{cut['continuation']}' for the rest of it."
+        )
     )
 
 
-@mcp.tool()
-async def get_answer(
-    question: str,
-    scope: str | None = None,
-    repo: str | None = None,
-) -> dict:
-    """Synthesised answer with citations and a calibrated trust signal.
+class _Retrieved(NamedTuple):
+    """What retrieval resolved, before any decision about how to answer.
 
-    The single entry point for questions: "how does X work" / "where is Y" /
-    "why is Z". It runs the full hybrid retrieval internally (no prior
-    search_codebase call needed) and answers in one round-trip.
-    confidence=high is content-grounded (value + citation-source + frame
-    gates): cite it directly, no verification Read needed. A "why" answer
-    whose named mechanism is absent from the retrieved source is downgraded
-    to medium (the rationale may be conflated). Low confidence returns
-    best_guesses with one-line justifications instead of an empty answer.
-    retrieval_quality separately rates the retrieval that fed synthesis.
-    When the answer names a function/method/class, ``symbol_bodies`` carries
-    its full live body — read that instead of a follow-up get_symbol.
-    ``episodes``, when present, is a dated fact recorded about this checkout
-    that bears on the question — evidence beside the answer, not a correction
-    of it. Weigh it against the answer; ``still_true`` says how current it is.
-
-    Args:
-        question: developer question.
-        scope: optional path-prefix filter (e.g. "src/pkg/").
-        repo: usually omitted.
+    ``hits`` is capped for the response payload; ``resolved_pool`` is the
+    same ranking before the cap, which is what ``candidates`` is built from.
     """
-    if repo == "all":
-        return _unsupported_repo_all("get_answer")
 
-    t0 = time.perf_counter()
-    ctx = await _resolve_repo_context(repo)
-    exclude_spec = _get_exclude_spec(ctx.path)
+    hits: list[dict]
+    resolved_pool: list[dict]
+    question_ids: set[str]
+    homonyms: dict
+    flow_paths: list[list[str]]
 
-    if not question or not question.strip():
-        return {
-            "answer": "",
-            "citations": [],
-            "confidence": "low",
-            "fallback_targets": [],
-            "retrieval": [],
-            "error": "question is required",
-            "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
-        }
 
-    async with get_session(ctx.session_factory) as session:
-        repository = await _get_repo(session)
-        repo_id = repository.id
+async def _run_retrieval_pipeline(
+    question: str, ctx, *, scope: str | None, exclude_spec, repo_id
+) -> _Retrieved:
+    """Run every retrieval, ranking and enrichment stage, in order.
 
-    # --- Data-shape fast path ----------------------------------------------
-    # "what fields does each entry in <blob> contain" is answered by mining the
-    # field set straight from source (a documented {...} shape, else consistent
-    # key accesses) instead of gating to a best_guesses pointer list — the exact
-    # payload that triggers the agent's Read/get_symbol drill. Runs before the
-    # cache and retrieval: it's deterministic from live source, cheap, and reads
-    # the field set directly (retrieval scatters across every file that touches
-    # the blob and misses the one file that documents it). Returns None (falls
-    # through) unless the fields are genuinely grounded, so it can never invent a
-    # shape.
-    ds_ids = _extract_question_identifiers(question)
-    if _is_data_shape_question(question, ds_ids):
-        grounded = await asyncio.to_thread(mine_data_shape, getattr(ctx, "path", None), ds_ids)
-        if grounded is not None:
-            return _build_data_shape_payload(grounded, t0, repository)
-
-    # --- Cache lookup --------------------------------------------------------
-    # Scope: ignore the (rare) `scope` argument in the cache key for now;
-    # scoped queries are uncommon and including scope would balloon hit rate
-    # variance. We hash on (repo_id, normalized_question) only.
-    qhash = _hash_question(question)
-    cache_disabled = _cache_disabled()
-    cached = None
-    if not cache_disabled:
-        async with get_session(ctx.session_factory) as session:
-            res = await session.execute(
-                select(AnswerCache).where(
-                    AnswerCache.repository_id == repo_id,
-                    AnswerCache.question_hash == qhash,
-                )
-            )
-            cached = res.scalar_one_or_none()
-    if cached is not None:
-        with contextlib.suppress(Exception):
-            payload = _json.loads(cached.payload_json)
-            # Schema bypass: payloads from a pre-rework code path don't carry
-            # the fields the current consumer expects (retrieval_quality,
-            # best_guesses, calibrated confidence). Returning them masks every
-            # subsequent improvement until the cache happens to expire. Bypass
-            # silently so the next write upgrades the row.
-            cached_version = payload.get("_schema_version", 1)
-            schema_stale = cached_version < _ANSWER_SCHEMA_VERSION
-            # Bypass-on-hedged: if the cached answer hedged, the retrieval +
-            # symbol pipeline has since been upgraded (question-aware symbol
-            # promotion, source-body excerpts). Give synthesis another shot
-            # with the new context rather than pinning the bad answer.
-            hedged_cache = _answer_is_hedged(payload.get("answer", ""))
-            # Bypass-on-empty: older versions cached gated (empty-answer)
-            # payloads, so a retrieval miss got pinned until TTL and every
-            # later improvement to the miss path was invisible. The write
-            # side no longer caches empty answers; this read-side check
-            # retires rows that predate that fix.
-            empty_cache = not (payload.get("answer") or "").strip()
-            # A row cached before exclude_patterns changed may reference a
-            # now-excluded file — in its fields or its prose. Re-synthesize
-            # rather than scrub the fields and leave the prose dangling.
-            cached_paths = [
-                *(payload.get("citations") or []),
-                *(payload.get("fallback_targets") or []),
-                # "path" is the serialized key; "target_path" survives in
-                # rows cached before the clean retrieval view existed.
-                *(h.get("path") or h.get("target_path") for h in (payload.get("retrieval") or [])),
-                *(g.get("file") for g in (payload.get("best_guesses") or [])),
-            ]
-            excluded_cache = any(is_excluded(p, exclude_spec) for p in cached_paths)
-            # Freshness: a row synthesised against a previous index may cite
-            # moved code or stale values. The write path stamps the repo's
-            # head commit into the persisted payload; a mismatch (or a row
-            # past the hard TTL, for pre-stamping rows and gitless repos)
-            # forces re-synthesis.
-            current_commit = getattr(repository, "head_commit", None)
-            cached_commit = payload.get("_indexed_commit")
-            stale_commit = bool(
-                cached_commit and current_commit and cached_commit != current_commit
-            )
-            expired = _cache_entry_expired(cached.created_at)
-            if schema_stale:
-                _log.info(
-                    "Bypassing cache entry at schema v%s (current v%s)",
-                    cached_version,
-                    _ANSWER_SCHEMA_VERSION,
-                )
-            elif hedged_cache:
-                _log.info("Bypassing hedged cache entry for re-synthesis")
-            elif empty_cache:
-                _log.info("Bypassing cached empty-answer (gated) entry")
-            elif excluded_cache:
-                _log.info("Bypassing cache entry referencing a now-excluded path")
-            elif stale_commit:
-                _log.info(
-                    "Bypassing cache entry from commit %s (repo now at %s)",
-                    cached_commit,
-                    current_commit,
-                )
-            elif expired:
-                _log.info("Bypassing cache entry past the %d-day TTL", _ANSWER_CACHE_TTL_DAYS)
-            else:
-                # Cache-internal fields never reach the consumer (response
-                # keys must not start with "_" except _meta).
-                payload.pop("_indexed_commit", None)
-                payload.pop("_schema_version", None)
-                payload["_meta"] = _build_meta(
-                    timing_ms=(time.perf_counter() - t0) * 1000,
-                    cached=True,
-                    hint=_answer_hint(
-                        payload.get("confidence", "low"),
-                        len(payload.get("retrieval", [])),
-                    ),
-                    repository=repository,
-                    targets=[p for p in cached_paths if isinstance(p, str) and p],
-                )
-                _apply_lean_high(payload, question)
-                _trim_served_payload(payload)
-                # Serve-time, on this path as well as the fresh one: the
-                # episode is read on every call and never cached into an
-                # answer, so a disagreement cannot be frozen into a row and
-                # served after the episode has been superseded.
-                await _attach_episode(
-                    payload,
-                    question=question,
-                    repo_path=getattr(ctx, "path", None),
-                    repo_name=getattr(repository, "name", None),
-                )
-                return payload
-
+    Everything here is about FINDING the material; nothing here decides what
+    the answer is. Each expansion stage is best-effort and suppressed on its
+    own, so one slow or broken backend costs its contribution and never the
+    call.
+    """
     # --- Retrieval pipeline ------------------------------------------------
     # Stages live in ``_answer_pipeline`` so each can evolve without
     # rereading the orchestrator: hybrid retrieval (FTS + vector + RRF) →
@@ -1043,7 +1459,7 @@ async def get_answer(
     homonyms: dict = {"union": {}, "qualified_miss": []}
     if question_ids:
         with contextlib.suppress(Exception):
-            _anchor_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
+            _anchor_root = _repo_root(ctx)
             async with get_session(ctx.session_factory) as session:
                 hits, homonyms = await _anchor_symbol_hits(
                     session,
@@ -1127,40 +1543,19 @@ async def get_answer(
                 await _hydrate_candidate_defines(
                     session, repo_id, resolved_pool, question_ids=question_ids
                 )
+    return _Retrieved(hits, resolved_pool, question_ids, homonyms, flow_paths)
 
-    # --- Qualified-miss guard ----------------------------------------------
-    # The question qualified a symbol (``Parent.leaf``) but the exact-name scan
-    # found the leaf only under OTHER parents. Return not-found rather than
-    # synthesizing from a same-named symbol elsewhere: a precise query must
-    # never degrade to a confidently-wrong answer (CodeGraph #173).
-    if homonyms.get("qualified_miss"):
-        missed = homonyms["qualified_miss"]
-        return _with_candidates(
-            {
-                "answer": "",
-                "citations": [],
-                "confidence": "low",
-                "note": (
-                    f"No indexed definition matches the qualified name(s) {missed}. "
-                    "The base name is defined elsewhere, but not under the "
-                    "class/module you named, so this is not returning a same-named "
-                    "symbol from another file, to avoid a confidently-wrong answer. "
-                    'Re-check the qualifier, or call search_codebase mode="symbol" '
-                    "on the base name to see every definition. The files retrieval "
-                    "ranked for this question are in candidates."
-                ),
-                "fallback_targets": [],
-                "retrieval": [],
-                "_meta": _build_meta(
-                    timing_ms=(time.perf_counter() - t0) * 1000,
-                    hint=_answer_hint("low", 0),
-                    repository=repository,
-                    targets=[],
-                ),
-            },
-            resolved_pool,
-        )
 
+def _union_answer_payload(
+    question: str, question_ids: set[str], homonyms: dict, ctx, repository, t0: float
+) -> dict | None:
+    """The answer-by-union reply, or None to let synthesis handle the question.
+
+    Returns None in three cases, all of which mean the union is not the
+    answer: no homonym group survived the defer rules, or the bodies could
+    not be read (no repo root, files gone), in which case falling through to
+    the normal gate path beats returning an empty union.
+    """
     # --- Answer-by-union (homonym exact-name lookup) -----------------------
     # The question named a symbol with N>=2 defs no qualifier disambiguates
     # (``_severity_for`` x 4). Instead of bailing to a best_guesses pointer list
@@ -1187,17 +1582,44 @@ async def get_answer(
     if union_groups and _flag_on(_UNION_MECHANISM_DEFER_ENV) and _is_mechanism_question(question):
         union_groups = {}
     if union_groups:
-        repo_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
+        repo_root = _repo_root(ctx)
         union_bodies, more_defs = build_homonym_union_bodies(repo_root, union_groups)
         if union_bodies:
             names = sorted(union_groups)
             total = sum(len(v) for v in union_groups.values())
             cited = sorted({b["path"] for b in union_bodies})
+            # This payload returns BEFORE synthesis, so none of the confidence
+            # gates below ever see it: it is served in no-LLM mode and it used
+            # to hardcode confidence="high" with "no verification Read" even
+            # when a body arrived truncated. "this is the complete set" is also
+            # an exclusivity claim, generated by us rather than by a model, and
+            # it is true of the DEFINITION SET while saying nothing about
+            # whether each body was served whole.
+            #
+            # The dependency test the synthesis gate uses CANNOT work here, and
+            # keying on it made this gate dead code. This path is reached only
+            # for naming/lookup questions about the homonym, so the question
+            # names the SERVED symbol by construction while the withheld symbols
+            # are its inner members, and there is no answer prose to inspect
+            # either. Here the bodies simply ARE the answer, so truncation alone
+            # is the right condition: a body the consumer cannot see is exactly
+            # what confidence should reflect. This is the one place the blunt cap
+            # the brief proposed is correct.
+            union_truncated = any(b.get("truncated") for b in union_bodies)
+            _union_confidence = "medium" if union_truncated else "high"
             note = (
                 f"{total} definition(s) of {', '.join(names)} exist (exact-name "
-                f"index scan; this is the complete set). {len(union_bodies)} "
-                "inlined below in symbol_bodies as live source; use them "
-                "directly, no verification Read."
+                f"index scan; this is the complete set of DEFINITIONS). "
+                f"{len(union_bodies)} inlined below in symbol_bodies as live "
+                "source"
+            )
+            note += (
+                "; use them directly, no verification Read."
+                if not union_truncated
+                else ". At least one body was truncated: see "
+                     "symbol_bodies[].withheld_symbols for what was not served, "
+                     "and call get_symbol with the continuation before relying "
+                     "on behaviour you cannot see."
             )
             if more_defs:
                 note += (
@@ -1215,7 +1637,7 @@ async def get_answer(
                     "implementations, so pick the one for your context."
                 ),
                 "citations": cited,
-                "confidence": "high",
+                "confidence": _union_confidence,
                 "grounding": "exact_symbol",
                 "symbol_bodies": union_bodies,
                 "fallback_targets": [b["path"] for b in union_bodies],
@@ -1223,16 +1645,402 @@ async def get_answer(
                 "note": note,
                 "_meta": _build_meta(
                     timing_ms=(time.perf_counter() - t0) * 1000,
-                    hint=_answer_hint("high", len(union_bodies)),
+                    hint=_answer_hint(_union_confidence, len(union_bodies)),
                     repository=repository,
                     targets=cited,
                 ),
             }
             if more_defs:
                 payload["more_definitions"] = more_defs
-            return _with_candidates(payload, resolved_pool)
+            return payload
         # Bodies unreadable (no repo root / files gone) — fall through to the
         # normal retrieval/gate path rather than returning an empty union.
+    return None
+
+
+class _Grade(NamedTuple):
+    """The confidence verdict, and every finding the notes are written from.
+
+    The gates do not just produce a label: each one that fires records WHAT
+    it objected to, and the payload builder turns that into the note and the
+    next action. Carrying the findings out beside the verdict is what keeps
+    the two in step.
+    """
+
+    confidence: str
+    hedged: bool
+    ratio: float
+    top_score: float
+    ungrounded_values: list[str]
+    frame_unsupported: list[str]
+    exclusivity_over_truncated: bool
+    withheld_implicated: list[str]
+    lookup_body_truncated: bool
+    named_body_cut: dict | None
+
+
+def _grade_answer(
+    *,
+    question: str,
+    question_ids: set[str],
+    answer_text: str,
+    hits: list[dict],
+    citations: list[str],
+    symbol_bodies: list[dict],
+    served_named_body: bool,
+    dominant: bool,
+    agreement_dominant: bool,
+) -> _Grade:
+    """Grade the synthesised answer through the gate cascade, in order.
+
+    One starting grade from retrieval dominance, then a run of gates that can
+    only demote it. Several are guarded on the answer still being at high, so
+    that one response cannot be pushed two levels for one problem. Read them
+    as a list of reasons not to trust the prose: the order is the order they
+    were added, and each comment says which failure it was built to catch.
+    """
+    # Compute confidence from the dominance ratio (top hit vs second hit).
+    # The dominance ratio is a more reliable separator than absolute BM25
+    # thresholds, which tend to label most retrievals "high" indiscriminately.
+    _ratio = _top_two_score_ratio(hits)
+    _top_score = hits[0].get("score", 0.0) if hits else 0.0
+    # Agreement lifts the RRF-compressed ratio: a consensus top hit (both
+    # retrievers rank it at/near #1) grades dominant even though its fused
+    # score barely outscores the runner-up. The score floor still applies, and
+    # is naturally cleared — a rank-0-in-both hit scores ~6 after RRF scaling.
+    _dominant_grade = _ratio >= _DOMINANCE_RATIO or agreement_dominant
+
+    # Strong answer-grounding can EARN "high" on a NON-dominant retrieval. RRF
+    # compresses sibling scores, so a rank-1 hit buried in a cluster of related
+    # files never "dominates" numerically and was capped at medium even when the
+    # synthesised answer is fully grounded in served source. Earn high when
+    # EITHER the question's named symbol body is served in-hand (tier-0 anchor),
+    # OR every distinctive mechanism term the answer names is grounded in the
+    # retrieval corpus AND a cited hit carries real symbol bodies. Conservative:
+    # a single ungrounded mechanism term disqualifies (that is the fabricated-
+    # mechanism signal), and the score floor still applies — this lifts
+    # non-dominant *well grounded* answers, never weakly-retrieved ones. The
+    # demotion gates below (hedge, value, claim-support) still pull an earned
+    # high back down.
+    earn_high = False
+    if _flag_on(_EARN_HIGH_GROUNDING_ENV) and _top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR:
+        _cited = set(citations)
+        _cited_has_body = any(h.get("symbols") for h in hits if h.get("target_path") in _cited)
+        _fu, _fg = _frame_term_grounding(answer_text, question, hits)
+        grounding_strong = _cited_has_body and _fg >= 1 and not _fu
+        earn_high = served_named_body or grounding_strong
+
+    if (_dominant_grade or earn_high) and _top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR:
+        confidence = "high"
+    elif _dominant_grade:
+        # Dominant but weak — the right file relative to its siblings, but
+        # the signal isn't strong enough to trust the synthesised answer
+        # without verification. Downgrade so the consumer Reads the source.
+        confidence = "medium"
+    else:
+        confidence = "medium"
+
+    # Second gate: downgrade when the LLM's own answer admits insufficiency.
+    # Retrieval dominance only tells us we indexed the right file; it does
+    # not mean the synthesized text is usable. Shipping a hedged answer with
+    # confidence="high" misleads the consumer AND drags the full retrieval
+    # payload (~10k chars) through the conversation cache for no benefit.
+    hedged = _answer_is_hedged(answer_text)
+    if hedged:
+        # A hedge means the synthesised PROSE is weak — but when the exact
+        # symbol the question named is inlined in symbol_bodies (tier-0 anchor,
+        # full live body), the answer's ground truth is already in-hand. Labeling
+        # that "low" contradicts the payload and fires the "go Read" hint the
+        # body makes unnecessary, so the agent bails to Read when it never needed
+        # to. Hold such a response at medium; the note below redirects the agent
+        # from the hedged prose to the served body.
+        confidence = "medium" if served_named_body else "low"
+
+    # Third gate — identifier-citation gate: when the question explicitly
+    # names identifiers (classes / methods / snake_case / CamelCase) and
+    # NONE of the top retrieval hits contain any of those identifiers as a
+    # hydrated symbol, retrieval may be pointing at plausible-but-wrong
+    # files (same module family, similar vocabulary). Downgrade high→medium
+    # so the consumer Reads the `fallback_targets`. Only applies when the
+    # question actually names identifiers — mechanism-descriptive questions
+    # (no symbol names) are unaffected.
+    if confidence == "high" and question_ids:
+        top_n = [h for h in hits[:_ENRICH_TOP_N_HITS] if h.get("symbols")]
+        has_match = any(s.get("_matched") for h in top_n for s in (h.get("symbols") or []))
+        if not has_match:
+            confidence = "medium"
+
+    # Fourth gate — value grounding: on value-shaped questions (default /
+    # threshold / limit / how many), every number the answer asserts must
+    # appear somewhere in the material retrieval actually contained. A
+    # number synthesis produced from thin air is a factual error delivered
+    # with authority — the single worst calibration failure, because the
+    # consumer was told not to verify. Cap at low and say why.
+    ungrounded_values: list[str] = []
+    if not hedged and _is_value_question(question):
+        ungrounded_values = _ungrounded_numbers(answer_text, hits)
+        if ungrounded_values:
+            confidence = "low"
+
+    # Fifth gate — citation-source gate: a high-confidence answer must cite
+    # at least one page that contributed actual source material (hydrated
+    # symbols with signatures/bodies), not just file summaries. Summary-only
+    # grounding is how plausible-but-wrong syntheses get through.
+    if confidence == "high":
+        cited = set(citations)
+        if not any(h.get("symbols") for h in hits if h.get("target_path") in cited):
+            confidence = "medium"
+
+    # Sixth gate — claim-support / frame grounding: a high-confidence answer
+    # must name its mechanism in terms the cited material actually contains. The
+    # dominance gate is generous on repo-internal questions (an anchored symbol +
+    # a dominant hit clear it), so a synthesis that conflates two mechanisms —
+    # right file, wrong reason/function — rides through at high confidence. The
+    # tell is a distinctive code-like term (a class / function / module the
+    # answer names AS the mechanism) that appears nowhere in everything retrieval
+    # showed: the "right file, wrong function inside it" failure. When such terms
+    # are not outweighed by grounded ones, downgrade high→medium so the consumer
+    # verifies instead of trusting.
+    #
+    # The original gate fired only on "why" questions, but the same failure
+    # occurs on "how" questions that name the mechanism in the ANSWER, not the
+    # question — the "right file, wrong function inside it" case. Broaden to
+    # mechanism/how questions too (behind the claim-support flag). Value questions
+    # have their own numeric gate above; naming/lookup questions legitimately just
+    # echo the named symbol, so they are excluded.
+    frame_unsupported: list[str] = []
+    _claim_scope = _is_why_question(question) or (
+        _flag_on(_CLAIM_SUPPORT_GATE_ENV) and _is_mechanism_question(question)
+    )
+    if confidence == "high" and not hedged and _claim_scope:
+        frame_unsupported, _grounded_terms = _frame_term_grounding(answer_text, question, hits)
+        if frame_unsupported and len(frame_unsupported) >= _grounded_terms:
+            confidence = "medium"
+        else:
+            frame_unsupported = []
+
+    # Seventh gate — completeness scope over truncated bodies: when prose asserts
+    # an unqualified exclusivity claim ("entirely", "the sole", "the only") while
+    # any cited symbol body arrived truncated: true, the answer asserts a global
+    # property from a sample it knows is incomplete (#1444).
+    # Guard: only fires at high (like gates 3 / 5 / 6) so it cannot stack with
+    # other downgrades and push a single response two levels for one problem.
+    exclusivity_over_truncated = False
+    if confidence == "high" and not hedged:
+        exclusivity_over_truncated = _has_unqualified_exclusivity_over_truncated(
+            answer_text, symbol_bodies
+        )
+        if exclusivity_over_truncated:
+            confidence = "medium"
+
+    # Eighth gate — a WITHHELD symbol the response depends on. The seventh gate
+    # needs an exclusivity token in the prose as well as truncation, and measured
+    # across four independent runs of the reference defect the token appears in
+    # only one of them: the other three are equally incomplete, equally "high",
+    # and it stays silent. It is also inert by construction in no-LLM mode, where
+    # there is no prose to hold a token.
+    #
+    # This gate keys on the dependency instead. It fires when a symbol in the
+    # withheld range is named by the QUESTION (every mode) or referenced as code
+    # by the ANSWER (LLM mode). Truncation alone is deliberately NOT enough:
+    # 22% of truncations withhold nothing the response leans on, and `high` is
+    # worth keeping when it is earned.
+    withheld_implicated = implicated_withheld_symbols(
+        question, answer_text, symbol_bodies
+    )
+    if confidence == "high" and withheld_implicated:
+        confidence = "medium"
+
+    # Ninth gate — the LOOKUP half of the eighth, and a routing hole rather
+    # than a threshold problem. Gate 8 asks whether the question names a
+    # WITHHELD symbol; on a bare-name lookup it provably never can, because the
+    # question names the symbol that was SERVED and the withheld names are that
+    # symbol's own inner members. #1451 closed exactly this shape on the union
+    # path with a cap on truncation alone, on the grounds that where the caller
+    # asked for a symbol the bodies ARE the answer. But a name with a single
+    # definition never reaches the union path — `_anchor_symbol_hits`
+    # short-circuits at `len(cands) == 1` before `homonyms["union"]` is built —
+    # so it lands here with the same shape and, until now, no cap.
+    #
+    # Measured on the 2026-08-12 corpus: `ModelAdmin` (django) served 120 of
+    # 1,753 lines at `high`, 93% of the cited body withheld; `useSlider` (mui)
+    # 120 of 558, 78% withheld. Two trees, two languages. The dominance ratios
+    # (1.67x, 1.29x) are not the cause and are not touched.
+    #
+    # Deliberately narrow. It needs the question to read as a symbol lookup
+    # rather than prose, AND the truncated body to be the very symbol the
+    # question named. On a prose question the body is evidence
+    # for a claim rather than the answer itself, and truncation alone is a poor
+    # signal there (22% of truncations withhold nothing the response leans on),
+    # which is why gate 8 keeps the dependency test for that population.
+    # Kept as the entry rather than a flag so the note can quote the real served
+    # range and continuation instead of describing the cut in the abstract.
+    #
+    # `truncated` alone is not trustworthy enough to demote on. It is set by
+    # comparing the INDEXED end_line against what was read, while the read
+    # clamps to the end of the live file — so a symbol whose stored end
+    # overshoots (an unsupported language or a syntax error leaves
+    # `check_symbol_bounds` unverified, and a file that shrank since indexing
+    # does it too) is served WHOLE and still flagged. Requiring the served span
+    # to have hit the line cap says the cut was ours, which is the only case
+    # where something was really withheld.
+    named_body_cut = next(
+        (b for b in symbol_bodies if _is_question_named_body_cut_by_us(b, question_ids)),
+        None,
+    )
+    lookup_body_truncated = (
+        confidence == "high"
+        and named_body_cut is not None
+        and is_symbol_lookup_question(question, question_ids)
+    )
+    if lookup_body_truncated:
+        confidence = "medium"
+
+    # Non-dominant ceiling: ambiguous retrieval is the calibration cost of
+    # always synthesizing — the answer may be right, but with no single dominant
+    # page it must never read "high" (cite without verifying). Cap at medium even
+    # if all six gates passed. (A non-dominant retrieval already scores <high via
+    # the ratio, so this is usually a no-op; it is explicit so the
+    # always-synthesize contract — "answered, but verify" — is self-documenting.)
+    # Exception: an answer that EARNED high via strong grounding (named symbol
+    # body in-hand, or every mechanism term grounded in a cited body) is not
+    # "cite without verifying" — the source IS in the payload — so the
+    # non-dominance ceiling does not apply to it.
+    if not dominant and not earn_high and confidence == "high":
+        confidence = "medium"
+    return _Grade(
+        confidence=confidence,
+        hedged=hedged,
+        ratio=_ratio,
+        top_score=_top_score,
+        ungrounded_values=ungrounded_values,
+        frame_unsupported=frame_unsupported,
+        exclusivity_over_truncated=exclusivity_over_truncated,
+        withheld_implicated=withheld_implicated,
+        lookup_body_truncated=lookup_body_truncated,
+        named_body_cut=named_body_cut,
+    )
+
+
+@mcp.tool()
+async def get_answer(
+    question: str,
+    scope: str | None = None,
+    repo: str | None = None,
+) -> dict:
+    """Synthesised answer with citations and a calibrated trust signal.
+
+    The single entry point for questions: "how does X work" / "where is Y" /
+    "why is Z". It runs the full hybrid retrieval internally (no prior
+    search_codebase call needed) and answers in one round-trip.
+    confidence=high is content-grounded (value + citation-source + frame
+    gates): cite it directly, no verification Read needed. A "why" answer
+    whose named mechanism is absent from the retrieved source is downgraded
+    to medium (the rationale may be conflated). Low confidence returns
+    best_guesses with one-line justifications instead of an empty answer.
+    retrieval_quality separately rates the retrieval that fed synthesis.
+    When the answer names a function/method/class, ``symbol_bodies`` carries
+    its full live body — read that instead of a follow-up get_symbol.
+    ``episodes``, when present, is a dated fact recorded about this checkout
+    that bears on the question — evidence beside the answer, not a correction
+    of it. Weigh it against the answer; ``still_true`` says how current it is.
+
+    Args:
+        question: developer question.
+        scope: optional path-prefix filter (e.g. "src/pkg/").
+        repo: usually omitted.
+    """
+    if repo == "all":
+        return _unsupported_repo_all("get_answer")
+
+    t0 = time.perf_counter()
+    ctx = await _resolve_repo_context(repo)
+    exclude_spec = _get_exclude_spec(ctx.path)
+
+    if not question or not question.strip():
+        return {
+            "answer": "",
+            "citations": [],
+            "confidence": "low",
+            "fallback_targets": [],
+            "retrieval": [],
+            "error": "question is required",
+            "_meta": _build_meta(timing_ms=(time.perf_counter() - t0) * 1000),
+        }
+
+    async with get_session(ctx.session_factory) as session:
+        repository = await _get_repo(session)
+        repo_id = repository.id
+
+    # --- Data-shape fast path ----------------------------------------------
+    # "what fields does each entry in <blob> contain" is answered by mining the
+    # field set straight from source (a documented {...} shape, else consistent
+    # key accesses) instead of gating to a best_guesses pointer list — the exact
+    # payload that triggers the agent's Read/get_symbol drill. Runs before the
+    # cache and retrieval: it's deterministic from live source, cheap, and reads
+    # the field set directly (retrieval scatters across every file that touches
+    # the blob and misses the one file that documents it). Returns None (falls
+    # through) unless the fields are genuinely grounded, so it can never invent a
+    # shape.
+    ds_ids = _extract_question_identifiers(question)
+    if _is_data_shape_question(question, ds_ids):
+        grounded = await asyncio.to_thread(mine_data_shape, getattr(ctx, "path", None), ds_ids)
+        if grounded is not None:
+            return _build_data_shape_payload(grounded, t0, repository)
+
+    # --- Cache lookup --------------------------------------------------------
+    # Scope: ignore the (rare) `scope` argument in the cache key for now;
+    # scoped queries are uncommon and including scope would balloon hit rate
+    # variance. We hash on (repo_id, normalized_question) only.
+    qhash = _hash_question(question)
+    cache_disabled = _cache_disabled()
+    if not cache_disabled:
+        served = await _serve_cached_answer(
+            ctx=ctx,
+            question=question,
+            repository=repository,
+            repo_id=repo_id,
+            qhash=qhash,
+            exclude_spec=exclude_spec,
+            t0=t0,
+        )
+        if served is not None:
+            return served
+
+    retrieved = await _run_retrieval_pipeline(
+        question, ctx, scope=scope, exclude_spec=exclude_spec, repo_id=repo_id
+    )
+    hits = retrieved.hits
+    resolved_pool = retrieved.resolved_pool
+    question_ids = retrieved.question_ids
+    homonyms = retrieved.homonyms
+    flow_paths = retrieved.flow_paths
+
+    # --- Qualified-miss guard ----------------------------------------------
+    # The question qualified a symbol (``Parent.leaf``) but the exact-name scan
+    # found the leaf only under OTHER parents. Return not-found rather than
+    # synthesizing from a same-named symbol elsewhere: a precise query must
+    # never degrade to a confidently-wrong answer (CodeGraph #173).
+    if homonyms.get("qualified_miss"):
+        missed = homonyms["qualified_miss"]
+        return _with_candidates(
+            _no_answer_payload(
+                f"No indexed definition matches the qualified name(s) {missed}. "
+                "The base name is defined elsewhere, but not under the "
+                "class/module you named, so this is not returning a same-named "
+                "symbol from another file, to avoid a confidently-wrong answer. "
+                'Re-check the qualifier, or call search_codebase mode="symbol" '
+                "on the base name to see every definition. The files retrieval "
+                "ranked for this question are in candidates.",
+                repository=repository,
+                t0=t0,
+            ),
+            resolved_pool,
+        )
+
+    union_payload = _union_answer_payload(question, question_ids, homonyms, ctx, repository, t0)
+    if union_payload is not None:
+        return _with_candidates(union_payload, resolved_pool)
 
     fallback_targets = [
         h["target_path"]
@@ -1247,26 +2055,15 @@ async def get_answer(
         # retrieval goes through ``_with_candidates``" is what stops the next
         # reordering of this function quietly re-opening the hole.
         return _with_candidates(
-            {
-                "answer": "",
-                "citations": [],
-                "confidence": "low",
-                "fallback_targets": [],
-                "retrieval": [],
-                "note": (
-                    "No wiki hits for this question. Rephrase around the code "
-                    'concept, or use search_codebase (mode="symbol" for an '
-                    'identifier, mode="path" for a file name); if the question '
-                    "names a file, call get_context on it directly. Grep only "
-                    "if those come back empty too."
-                ),
-                "_meta": _build_meta(
-                    timing_ms=(time.perf_counter() - t0) * 1000,
-                    hint=_answer_hint("low", 0),
-                    repository=repository,
-                    targets=[],
-                ),
-            },
+            _no_answer_payload(
+                "No wiki hits for this question. Rephrase around the code "
+                'concept, or use search_codebase (mode="symbol" for an '
+                'identifier, mode="path" for a file name); if the question '
+                "names a file, call get_context on it directly. Grep only "
+                "if those come back empty too.",
+                repository=repository,
+                t0=t0,
+            ),
             resolved_pool,
         )
 
@@ -1447,6 +2244,24 @@ async def get_answer(
             )
 
     # --- Synthesis (LLM) ---------------------------------------------------
+    # Both ways synthesis can go missing return the same payload from the same
+    # evidence, so they name only what differs between them: why, and what to
+    # tell the caller.
+    async def _degrade(reason: str, note: str) -> dict:
+        return await _degraded_payload(
+            reason=reason,
+            note=note,
+            hits=hits,
+            fallback_targets=fallback_targets,
+            repository=repository,
+            t0=t0,
+            ctx=ctx,
+            question_ids=question_ids,
+            exclude_spec=exclude_spec,
+            agreement_dominant=agreement_dominant,
+            resolved_pool=resolved_pool,
+        )
+
     provider = _resolve_provider_for_answer(getattr(ctx, "path", None))
     if provider is None:
         # Retrieval-only mode (no provider). Return the hits so the agent can
@@ -1457,18 +2272,10 @@ async def get_answer(
             "get_answer running WITHOUT synthesis: no LLM provider resolvable "
             "(set REPOWISE_PROVIDER + its API key, or any supported API key)."
         )
-        return _degraded_payload(
-            reason="no-llm-provider",
-            note=(
-                "DEGRADED: no LLM provider configured (set REPOWISE_PROVIDER "
-                "+ API key). "
-                "Returning retrieval hits only — Read the listed files to answer."
-            ),
-            hits=hits,
-            fallback_targets=fallback_targets,
-            repository=repository,
-            t0=t0,
-            resolved_pool=resolved_pool,
+        return await _degrade(
+            "no-llm-provider",
+            "DEGRADED: no LLM provider configured (set REPOWISE_PROVIDER "
+            "+ API key). Synthesis is what is missing here, not retrieval.",
         )
 
     # Decision fusion (why-shaped questions only) + structured prelude. Both
@@ -1502,15 +2309,7 @@ async def get_answer(
         repo_id=repo_id,
     )
     if failure_note is not None:
-        return _degraded_payload(
-            reason="synthesis-failed",
-            note=failure_note,
-            hits=hits,
-            fallback_targets=fallback_targets,
-            repository=repository,
-            t0=t0,
-            resolved_pool=resolved_pool,
-        )
+        return await _degrade("synthesis-failed", failure_note)
 
     citations = [
         h["target_path"] for h in hits if h["target_path"] and h["target_path"] in answer_text
@@ -1560,199 +2359,40 @@ async def get_answer(
     # from get_symbol's `verified` contract. When the indexed body is longer
     # than the hydrator's line cap, a `continuation` names the exact range
     # read for the remainder (mirrors get_symbol).
-    _body_candidates = _gather_body_candidates(hits, answer_text)
-
-    symbol_bodies: list[dict] = []
-    _seen_bodies: set[tuple[str, str]] = set()
-    # True once a tier-0 body (the exact symbol the question named, resolved by
-    # symbol anchoring) is inlined. Its full live body IS the ground truth, so a
-    # response carrying it is content-grounded even when synthesis hedges — the
-    # confidence gate below reads this to avoid the "low, go Read" label that
-    # contradicts a payload already holding the answer (2026-07-11 dogfood).
-    served_named_body = False
-    repo_root = Path(str(ctx.path)) if getattr(ctx, "path", None) else None
-    for _tier, _kind_rank, start, path, s in _body_candidates:
-        if len(symbol_bodies) >= _INLINE_BODY_MAX_SYMBOLS:
-            break
-        name = s["name"]
-        if (path, name) in _seen_bodies:
-            continue
-        sym_end = s.get("end_line") or 0
-        # Re-read a fuller body than the synthesis excerpt: this block is for
-        # the agent, so a docstring-heavy def shouldn't spend its whole window
-        # on docstring and truncate the logic the question asked about. Falls
-        # back to the hydrator's excerpt if the re-read fails.
-        body = _read_symbol_source(
-            repo_root, path, start, sym_end, max_lines=_INLINE_BODY_MAX_LINES
-        ) or s.get("source_excerpt")
-        if not body:
-            continue
-        served = body.count("\n") + 1
-        end_served = start + served - 1
-        sym_end = sym_end or end_served
-        entry: dict = {
-            "path": path,
-            "name": name,
-            "lines": [start, end_served],
-            "source": body,
-        }
-        if sym_end > end_served:
-            entry["truncated"] = True
-            entry["continuation"] = f"{path}:{end_served + 1}-{sym_end}"
-        symbol_bodies.append(entry)
-        _seen_bodies.add((path, name))
-        if _tier == 0:
-            served_named_body = True
-
-    # Compute confidence from the dominance ratio (top hit vs second hit).
-    # The dominance ratio is a more reliable separator than absolute BM25
-    # thresholds, which tend to label most retrievals "high" indiscriminately.
-    if len(hits) >= 2:
-        _top = hits[0].get("score", 0.0)
-        _second = hits[1].get("score", 0.0) or 1e-9
-        _ratio = _top / _second
-    else:
-        _ratio = float("inf") if hits else 0.0
-    _top_score = hits[0].get("score", 0.0) if hits else 0.0
-    # Agreement lifts the RRF-compressed ratio: a consensus top hit (both
-    # retrievers rank it at/near #1) grades dominant even though its fused
-    # score barely outscores the runner-up. The score floor still applies, and
-    # is naturally cleared — a rank-0-in-both hit scores ~6 after RRF scaling.
-    _dominant_grade = _ratio >= _DOMINANCE_RATIO or agreement_dominant
-
-    # Strong answer-grounding can EARN "high" on a NON-dominant retrieval. RRF
-    # compresses sibling scores, so a rank-1 hit buried in a cluster of related
-    # files never "dominates" numerically and was capped at medium even when the
-    # synthesised answer is fully grounded in served source. Earn high when
-    # EITHER the question's named symbol body is served in-hand (tier-0 anchor),
-    # OR every distinctive mechanism term the answer names is grounded in the
-    # retrieval corpus AND a cited hit carries real symbol bodies. Conservative:
-    # a single ungrounded mechanism term disqualifies (that is the fabricated-
-    # mechanism signal), and the score floor still applies — this lifts
-    # non-dominant *well grounded* answers, never weakly-retrieved ones. The
-    # demotion gates below (hedge, value, claim-support) still pull an earned
-    # high back down.
-    earn_high = False
-    if _flag_on(_EARN_HIGH_GROUNDING_ENV) and _top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR:
-        _cited = set(citations)
-        _cited_has_body = any(h.get("symbols") for h in hits if h.get("target_path") in _cited)
-        _fu, _fg = _frame_term_grounding(answer_text, question, hits)
-        grounding_strong = _cited_has_body and _fg >= 1 and not _fu
-        earn_high = served_named_body or grounding_strong
-
-    if (_dominant_grade or earn_high) and _top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR:
-        confidence = "high"
-    elif _dominant_grade:
-        # Dominant but weak — the right file relative to its siblings, but
-        # the signal isn't strong enough to trust the synthesised answer
-        # without verification. Downgrade so the consumer Reads the source.
-        confidence = "medium"
-    else:
-        confidence = "medium"
-
-    # Second gate: downgrade when the LLM's own answer admits insufficiency.
-    # Retrieval dominance only tells us we indexed the right file; it does
-    # not mean the synthesized text is usable. Shipping a hedged answer with
-    # confidence="high" misleads the consumer AND drags the full retrieval
-    # payload (~10k chars) through the conversation cache for no benefit.
-    hedged = _answer_is_hedged(answer_text)
-    if hedged:
-        # A hedge means the synthesised PROSE is weak — but when the exact
-        # symbol the question named is inlined in symbol_bodies (tier-0 anchor,
-        # full live body), the answer's ground truth is already in-hand. Labeling
-        # that "low" contradicts the payload and fires the "go Read" hint the
-        # body makes unnecessary, so the agent bails to Read when it never needed
-        # to. Hold such a response at medium; the note below redirects the agent
-        # from the hedged prose to the served body.
-        confidence = "medium" if served_named_body else "low"
-
-    # Third gate — identifier-citation gate: when the question explicitly
-    # names identifiers (classes / methods / snake_case / CamelCase) and
-    # NONE of the top retrieval hits contain any of those identifiers as a
-    # hydrated symbol, retrieval may be pointing at plausible-but-wrong
-    # files (same module family, similar vocabulary). Downgrade high→medium
-    # so the consumer Reads the `fallback_targets`. Only applies when the
-    # question actually names identifiers — mechanism-descriptive questions
-    # (no symbol names) are unaffected.
-    if confidence == "high" and question_ids:
-        top_n = [h for h in hits[:_ENRICH_TOP_N_HITS] if h.get("symbols")]
-        has_match = any(s.get("_matched") for h in top_n for s in (h.get("symbols") or []))
-        if not has_match:
-            confidence = "medium"
-
-    # Fourth gate — value grounding: on value-shaped questions (default /
-    # threshold / limit / how many), every number the answer asserts must
-    # appear somewhere in the material retrieval actually contained. A
-    # number synthesis produced from thin air is a factual error delivered
-    # with authority — the single worst calibration failure, because the
-    # consumer was told not to verify. Cap at low and say why.
-    ungrounded_values: list[str] = []
-    if not hedged and _is_value_question(question):
-        ungrounded_values = _ungrounded_numbers(answer_text, hits)
-        if ungrounded_values:
-            confidence = "low"
-
-    # Fifth gate — citation-source gate: a high-confidence answer must cite
-    # at least one page that contributed actual source material (hydrated
-    # symbols with signatures/bodies), not just file summaries. Summary-only
-    # grounding is how plausible-but-wrong syntheses get through.
-    if confidence == "high":
-        cited = set(citations)
-        if not any(h.get("symbols") for h in hits if h.get("target_path") in cited):
-            confidence = "medium"
-
-    # Sixth gate — claim-support / frame grounding: a high-confidence answer
-    # must name its mechanism in terms the cited material actually contains. The
-    # dominance gate is generous on repo-internal questions (an anchored symbol +
-    # a dominant hit clear it), so a synthesis that conflates two mechanisms —
-    # right file, wrong reason/function — rides through at high confidence. The
-    # tell is a distinctive code-like term (a class / function / module the
-    # answer names AS the mechanism) that appears nowhere in everything retrieval
-    # showed: the "right file, wrong function inside it" failure. When such terms
-    # are not outweighed by grounded ones, downgrade high→medium so the consumer
-    # verifies instead of trusting.
-    #
-    # The original gate fired only on "why" questions, but the same failure
-    # occurs on "how" questions that name the mechanism in the ANSWER, not the
-    # question — the "right file, wrong function inside it" case. Broaden to
-    # mechanism/how questions too (behind the claim-support flag). Value questions
-    # have their own numeric gate above; naming/lookup questions legitimately just
-    # echo the named symbol, so they are excluded.
-    frame_unsupported: list[str] = []
-    _claim_scope = _is_why_question(question) or (
-        _flag_on(_CLAIM_SUPPORT_GATE_ENV) and _is_mechanism_question(question)
+    # ``served_named_body`` is True once a tier-0 body (the exact symbol the
+    # question named, resolved by symbol anchoring) is inlined. Its full live
+    # body IS the ground truth, so a response carrying it is content-grounded
+    # even when synthesis hedges. The confidence gate below reads this to avoid
+    # the "low, go Read" label that contradicts a payload already holding the
+    # answer (2026-07-11 dogfood).
+    repo_root = _repo_root(ctx)
+    symbol_bodies, served_named_body = _build_symbol_bodies(
+        _gather_body_candidates(hits, answer_text), repo_root
     )
-    if confidence == "high" and not hedged and _claim_scope:
-        frame_unsupported, _grounded_terms = _frame_term_grounding(answer_text, question, hits)
-        if frame_unsupported and len(frame_unsupported) >= _grounded_terms:
-            confidence = "medium"
-        else:
-            frame_unsupported = []
 
-    # Non-dominant ceiling: ambiguous retrieval is the calibration cost of
-    # always synthesizing — the answer may be right, but with no single dominant
-    # page it must never read "high" (cite without verifying). Cap at medium even
-    # if all six gates passed. (A non-dominant retrieval already scores <high via
-    # the ratio, so this is usually a no-op; it is explicit so the
-    # always-synthesize contract — "answered, but verify" — is self-documenting.)
-    # Exception: an answer that EARNED high via strong grounding (named symbol
-    # body in-hand, or every mechanism term grounded in a cited body) is not
-    # "cite without verifying" — the source IS in the payload — so the
-    # non-dominance ceiling does not apply to it.
-    if not dominant and not earn_high and confidence == "high":
-        confidence = "medium"
+    grade = _grade_answer(
+        question=question,
+        question_ids=question_ids,
+        answer_text=answer_text,
+        hits=hits,
+        citations=citations,
+        symbol_bodies=symbol_bodies,
+        served_named_body=served_named_body,
+        dominant=dominant,
+        agreement_dominant=agreement_dominant,
+    )
+    confidence = grade.confidence
+    hedged = grade.hedged
+    _ratio = grade.ratio
+    _top_score = grade.top_score
+    ungrounded_values = grade.ungrounded_values
+    frame_unsupported = grade.frame_unsupported
+    exclusivity_over_truncated = grade.exclusivity_over_truncated
+    withheld_implicated = grade.withheld_implicated
+    lookup_body_truncated = grade.lookup_body_truncated
+    named_body_cut = grade.named_body_cut
 
-    # retrieval_quality is a separate signal from confidence. Where confidence
-    # says "how much should you trust the synthesised text", retrieval_quality
-    # says "how good was the retrieval that fed it". The agent uses confidence
-    # to decide whether to re-read; retrieval_quality to decide whether to
-    # call search_codebase again with a refined query.
-    if _top_score >= _HIGH_CONFIDENCE_SCORE_FLOOR and _dominant_grade:
-        retrieval_quality = "high"
-    elif _dominant_grade:
-        retrieval_quality = "partial"
-    else:
-        retrieval_quality = "weak"
+    retrieval_quality = _retrieval_quality(hits, agreement_dominant)
 
     if hedged:
         # Hedged answers: keep the retrieval payload lean but non-empty. The
@@ -1873,13 +2513,124 @@ async def get_answer(
                 f"Verify the mechanism before citing: the asserted term(s) "
                 f"{frame_unsupported} are not in the retrieved material."
             )
+        elif exclusivity_over_truncated:
+            # Note names the axis of doubt (what to be uncertain about), not the
+            # check that triggered it — so a reader can tell which kind of doubt
+            # this is without consulting the source code.
+            payload["note"] = (
+                "Answer may not cover every relevant site: a cited symbol's body "
+                "was truncated and the answer makes an unqualified causal claim. "
+                "Other functions may also participate; call get_symbol for the "
+                "full body or verify against "
+                f"{fallback_targets[0] if fallback_targets else 'the cited source'}."
+            )
+            if fallback_targets:
+                payload["next_action_hint"] = (
+                    f"Read {fallback_targets[0]} to verify whether other functions "
+                    "participate beyond what the truncated symbol body shows."
+                )
+        elif withheld_implicated:
+            # A withheld entry whose name matches the body it was found in is
+            # the ENCLOSING symbol — served up to the cut and continuing past
+            # it — not a symbol that never arrived. Calling that "not served"
+            # is wrong about the payload directly above the note, and sends the
+            # caller to get_symbol for a body they already hold most of:
+            # `NewCmdRoot` lines 53-173 are in the payload and only 174-221 are
+            # missing. The accurate pointer is the `continuation` the entry
+            # already carries, which fetches just the missing part and is a
+            # valid get_symbol id in its own right ("path.py:174-221").
+            # Measured: 7 instances on 5 of 6 corpus trees.
+            _implicated = set(withheld_implicated)
+            _continuing = [b for b in symbol_bodies if _is_enclosing_continuation(b, _implicated)]
+            _continuing_names = {b["name"] for b in _continuing}
+            _absent = [n for n in withheld_implicated if n not in _continuing_names]
+            # Only advertise an id get_symbol can actually answer. The scanner
+            # that produced these is a regex over source lines, so it can name
+            # something that is not a symbol, and the id does not stay in a list
+            # of eight — it becomes the next action the payload tells the agent
+            # to take. When none resolves the names are still reported; only the
+            # dead pointer is withheld.
+            _hint_id = await _first_resolvable_id(
+                [
+                    s["symbol_id"]
+                    for b in symbol_bodies
+                    for s in (b.get("withheld_symbols") or [])
+                    if s.get("name") in set(_absent)
+                ],
+                ctx,
+                repository,
+                exclude_spec,
+            )
+            _parts = []
+            if _absent:
+                _parts.append(
+                    "Part of the code this answer depends on was not served: "
+                    f"{', '.join(_absent)}."
+                    + (
+                        " Continue in this tool with "
+                        f"get_symbol id='{_hint_id}' before relying on the mechanism."
+                        if _hint_id
+                        else ""
+                    )
+                )
+            # Qualify by path only when the same name was cut in more than one
+            # file, so the common case stays readable and the ambiguous case
+            # does not ship two sentences that look identical.
+            _dupe = len({_b["name"] for _b in _continuing}) < len(_continuing)
+            for _b in _continuing:
+                _who = f"{_b['name']} ({_b['path']})" if _dupe else _b["name"]
+                _parts.append(
+                    f"{_who} was served through line {_b['lines'][1]}; the rest "
+                    f"of its body is at {_b['continuation']}."
+                )
+            payload["note"] = " ".join(_parts)
+            payload["next_action_hint"] = (
+                f"call get_symbol id='{_hint_id}' for the withheld body"
+                if _hint_id
+                else (
+                    f"call get_symbol id='{_continuing[0]['continuation']}' for the rest "
+                    f"of {_continuing[0]['name']}"
+                    if _continuing
+                    else "request the withheld body before citing"
+                )
+            )
+        elif lookup_body_truncated:
+            # The ninth gate fired: the caller asked for a symbol by name and
+            # its body did not fit. Without this the demotion would ship with
+            # no note at all, since the high-confidence branch below is now
+            # unreachable for it.
+            payload["note"] = (
+                f"You asked for {named_body_cut['name']} and its body did not fit: "
+                f"lines {named_body_cut['lines'][0]}-{named_body_cut['lines'][1]} are "
+                f"served and it continues at {named_body_cut['continuation']}. Held at "
+                "medium because on a symbol lookup the part you cannot see is part of "
+                "the answer."
+            )
+            payload["next_action_hint"] = (
+                f"call get_symbol id='{named_body_cut['continuation']}' for the rest of "
+                f"{named_body_cut['name']}"
+            )
         elif confidence == "high":
+            # The rationale deliberately no longer cites "the answer is direct
+            # (no hedging)". _SYSTEM_PROMPT instructs the model not to hedge, so
+            # scoring the absence of hedging as evidence FOR confidence is
+            # circular: the pipeline mandates directness and then reads its own
+            # mandate back as a signal. Dominance is an independent measurement;
+            # directness is not.
+            _tail = (
+                "Cite this answer; do not re-read the source unless a specific "
+                "detail is missing."
+                if not any(b.get("truncated") for b in symbol_bodies)
+                # Never tell the consumer to skip re-reading when the payload
+                # itself admits it withheld part of a cited body. The withheld
+                # names are in `symbol_bodies[].withheld_symbols`.
+                else "Some cited bodies were truncated; see "
+                     "symbol_bodies[].withheld_symbols for what was not served."
+            )
             payload["note"] = (
                 "High confidence: top retrieval result clearly dominates "
-                f"(dominance ratio {_ratio:.2f}x, top score {_top_score:.2f}) "
-                "AND the synthesised answer is direct (no hedging). Cite this "
-                "answer; do not re-read the source unless a specific detail "
-                "is missing."
+                f"(dominance ratio {_ratio:.2f}x, top score {_top_score:.2f}). "
+                + _tail
             )
 
         # Concept anchoring put a comment-justified file at the top, so synthesis
@@ -1937,39 +2688,16 @@ async def get_answer(
     if candidates:
         payload["candidates"] = candidates
 
-    # Persist to cache (upsert). Best-effort: cache failures must never block
-    # the response — but they must be LOGGED, not suppressed. A plain INSERT
-    # under a blanket suppress violated uq_answer_cache_q on every
-    # bypass-and-resynthesize round and failed silently, so hedged/stale rows
-    # were never upgraded. Delete-then-insert in one transaction is the
-    # dialect-agnostic upsert; the stamped _indexed_commit drives the
-    # read-side freshness check.
     if answer_text and not cache_disabled:
-        cache_payload = dict(payload)
-        cache_payload["_schema_version"] = _ANSWER_SCHEMA_VERSION
-        commit_now = getattr(repository, "head_commit", None)
-        if commit_now:
-            cache_payload["_indexed_commit"] = commit_now
-        try:
-            async with get_session(ctx.session_factory) as session:
-                await session.execute(
-                    delete(AnswerCache).where(
-                        AnswerCache.repository_id == repo_id,
-                        AnswerCache.question_hash == qhash,
-                    )
-                )
-                row = AnswerCache(
-                    repository_id=repo_id,
-                    question_hash=qhash,
-                    question=question.strip(),
-                    payload_json=_json.dumps(cache_payload, default=_json_default),
-                    provider_name=getattr(provider, "provider_name", "") or "",
-                    model_name=getattr(provider, "model_name", "") or "",
-                )
-                session.add(row)
-                await session.commit()
-        except Exception as exc:
-            _log.warning("get_answer cache write failed: %s", exc)
+        await _write_answer_cache(
+            payload,
+            ctx=ctx,
+            question=question,
+            repository=repository,
+            repo_id=repo_id,
+            qhash=qhash,
+            provider=provider,
+        )
 
     payload["_meta"] = _build_meta(
         timing_ms=(time.perf_counter() - t0) * 1000,
@@ -1991,12 +2719,11 @@ async def get_answer(
     # ``best_guesses`` outright), so the cut sees the finished payload and the
     # cached row keeps the shape its schema version promises.
     _trim_served_payload(payload)
-    # After the cache write above, deliberately. ``cache_payload`` is a shallow
-    # copy taken before this point, so the episode reaches the caller and never
-    # the cache row — which is why adding it needs no _ANSWER_SCHEMA_VERSION
-    # bump: a row written before this change and one written after are the same
-    # bytes, and bumping would invalidate every user's cache for a field that
-    # is not in it.
+    # After the cache write above, deliberately. That write copies the payload
+    # as it stood then, so the episode reaches the caller and never the cache
+    # row, which is why adding it needs no _ANSWER_SCHEMA_VERSION bump: a row
+    # written before this change and one written after are the same bytes, and
+    # bumping would invalidate every user's cache for a field that is not in it.
     await _attach_episode(
         payload,
         question=question,

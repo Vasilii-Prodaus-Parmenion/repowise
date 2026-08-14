@@ -12,7 +12,74 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import sys
 from typing import Protocol, runtime_checkable
+
+import structlog
+
+log = structlog.get_logger(__name__)
+
+
+def resolve_embedding_timeout(
+    explicit: float | None, default: float, *, provider_env: str | None = None
+) -> float:
+    """Seconds allowed per embedding request.
+
+    Precedence: explicit arg > ``provider_env`` > ``REPOWISE_EMBEDDING_TIMEOUT``
+    > *default*. Raisable because against a local endpoint one request is GPU
+    work, and an expired batch is not retried — it surfaces only as "N/N items
+    failed to embed".
+
+    A malformed *env* value warns and falls back; raising would reach
+    ``build_embedder``'s ``except Exception`` and downgrade the run to a keyless
+    8-wide index. An invalid *explicit* argument is a caller bug and raises.
+    """
+    if explicit is not None:
+        if isinstance(explicit, bool) or not isinstance(explicit, int | float):
+            raise ValueError("timeout must be a positive number")
+        if not math.isfinite(explicit) or explicit <= 0:
+            raise ValueError("timeout must be a positive number")
+        return float(explicit)
+    names = [provider_env] if provider_env else []
+    names.append("REPOWISE_EMBEDDING_TIMEOUT")
+    invalid: list[tuple[str, str]] = []
+    selected = default
+    for name in names:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            value = math.nan
+        # isfinite also rejects "inf" — a plausible way to ask for no limit, and
+        # the one value that hangs a stalled endpoint forever.
+        if math.isfinite(value) and value > 0:
+            selected = value
+            break
+        # A value that failed to parse is not a value, so it must not consume
+        # the narrower variable's precedence over the shared one.
+        invalid.append((name, raw))
+    for name, raw in invalid:
+        _report_invalid_timeout(name, raw, selected)
+    return selected
+
+
+def _report_invalid_timeout(var: str, raw: str, default: float) -> None:
+    """Say it where the user will actually see it.
+
+    The CLI pins structlog to ERROR unless ``-v``, so a warning here reaches
+    nobody on the path that matters — and the symptom this variable exists to
+    cure ("N/N items failed to embed") is exactly what a silently-ignored value
+    produces. stderr matches how ``build_embedder`` reports the same class of
+    misconfiguration.
+    """
+    log.warning("embedding_timeout_invalid", var=var, value=raw, using=default)
+    print(
+        f"{var}={raw!r} is not a positive number of seconds; using {default}s.",
+        file=sys.stderr,
+    )
 
 
 @runtime_checkable

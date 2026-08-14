@@ -368,7 +368,41 @@ _HIGH_CONFIDENCE_SCORE_FLOOR = 1.5
 # contains. Cached pre-v12 rows carry the bare {path, lines} shape, which is the
 # named-but-not-carried payload this version exists to replace, so they must
 # bypass rather than serve the old block back.
-_ANSWER_SCHEMA_VERSION = 12
+# v13: withheld-body calibration — a truncated symbol_bodies entry now carries
+# `withheld_symbols`, confidence is capped when the response depends on one of
+# them (and on the homonym-union path whenever any cited body was truncated),
+# and the high/union notes no longer tell the caller to skip re-reading a
+# payload that admits it withheld part of a cited body. Cached pre-v13 rows
+# carry both the old `high` and the old "do not re-read the source" note, which
+# is precisely what this version exists to stop serving, so they must bypass.
+# v14: the LOOKUP half of v13. v13 capped the homonym-union path on truncation
+# alone, but a name with exactly ONE definition never reaches that path, so a
+# bare-symbol-name question about a uniquely-defined symbol still graded `high`
+# with most of the cited body withheld (measured: 93% and 78% withheld, on two
+# trees and two languages). It is now capped the same way. Separately, a
+# withheld entry naming the very symbol the payload already served is described
+# by its `continuation` range instead of being reported as "not served" with a
+# get_symbol pointer to a body the caller already holds most of. Cached pre-v14
+# rows carry both the old `high` and the old note, so they must bypass.
+# v15: the scanner behind `withheld_symbols` stops reading backtick strings as
+# code. Go raw strings and TS template literals were never masked, so the
+# GraphQL and interpolated text inside them was emitted as symbols — 282 of
+# 22,898 sweep entries on cli/cli, 19 of them the HEADLINE entry the note tells
+# the agent to fetch. Those ids are not dead (`get_symbol` answers them with a
+# live grep, since the name really is on that line) but they are misleading:
+# the "symbol" is a GraphQL field. A cached pre-v15 row still lists them, so it
+# must bypass. Secondarily, the note no longer advertises a symbol_id that
+# resolves to nothing at all — a guard rather than an observed fix, since 0 of
+# the 130 ids on the corpus were dead ends.
+# NOT bumped for the degraded-payload rework (`symbol_bodies` / `citations` /
+# `grounding` / `next_action_hint` / `retrieval_quality` on the no-provider and
+# synthesis-failed paths). Every one of those is a response-shape change, which
+# is normally exactly what this counter is for, but no cached row can carry the
+# old shape: the cache write is gated on `answer_text` and sits below both
+# degraded returns, so a degraded payload has never been written to it. The
+# synthesised shape is untouched. A bump here would invalidate every keyed
+# install's cache, and re-synthesis is real provider spend, for nothing.
+_ANSWER_SCHEMA_VERSION = 15
 
 # Hard TTL on answer-cache rows. Commit-based invalidation (the payload's
 # stamped ``_indexed_commit`` vs the repo's current head) is the primary
@@ -429,9 +463,15 @@ _SYSTEM_PROMPT = (
     "Aim for 150–400 words — enough to cover the asked aspects without "
     "padding. If a [question-match] symbol's source body is provided, "
     "you have enough material to answer — ground in that body. Only "
-    "hedge (say 'inspect the source' / 'the excerpts do not contain…') "
-    "when there is genuinely no relevant signature, docstring, or source "
-    "body in the excerpts. Never invent file paths."
+    "hedge about having enough material (say 'inspect the source' / "
+    "'the excerpts do not contain…') when there is genuinely no relevant "
+    "signature, docstring, or source body in the excerpts. Never assert "
+    "exhaustiveness: state what the retrieved excerpts show, not that "
+    "they are the complete set of sites. Unattributed exclusivity "
+    "language ('entirely', 'the sole', 'the only place', 'depends only on') "
+    "is not justified from a top-k slice — omit it unless the retrieved "
+    "material itself (an assertion, a type constraint, or an explicit "
+    "comment) says so. Never invent file paths."
 )
 
 _USER_TEMPLATE = """\
@@ -444,6 +484,8 @@ Project wiki excerpts (top {n} retrieval hits):
 Answer thoroughly (150–400 words). Cite file paths inline and line
 numbers when the excerpt provides them. Prefer a structured layout
 (headings, bullets, short code block from the source body) on
-mechanism / architecture questions. Only hedge if no signature,
-docstring, or source body in the excerpts is relevant.
+mechanism / architecture questions. Only hedge about having enough
+material if no signature, docstring, or source body in the excerpts is
+relevant. Do not assert that what you were shown is the complete set
+of sites; qualify causal claims when a symbol's body was truncated.
 """

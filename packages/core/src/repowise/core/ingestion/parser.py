@@ -44,6 +44,10 @@ from .extractors import (
     refine_kotlin_class_kind,
 )
 from .extractors.bindings.python import expand_bare_relative_imports
+from .extractors.bindings.ts_js import (
+    declarator_binds_callable,
+    declarator_value_is_module_ref,
+)
 from .extractors.synthetic_symbols import extract_synthetic_symbols
 from .extractors.visibility import (
     refine_cpp_visibility,
@@ -67,11 +71,13 @@ from .parser_helpers import (
     _classify_param_origin,
     _collect_error_nodes,
     _count_arguments,
+    _dedupe_pascal_interface_symbols,
     _find_enclosing_symbol,
     _has_callable_ancestor,
     _head_type_identifier,
     _is_async_node,
     _qualified_cpp_parent,
+    _qualified_pascal_parent,
     _run_query,
 )
 from .python_local_refs import extract_python_local_refs
@@ -308,11 +314,15 @@ class ASTParser:
         # ``prepare_source`` blanks the markup and <style> so what reaches the
         # TypeScript grammar is valid TS at byte-identical offsets — no offset
         # translation is needed anywhere downstream. A no-op for every other
-        # language.
+        # language without a registered locator/sanitizer -- Pascal's
+        # sanitizers (project-file `in '...'` clauses, ERROR-node blanking)
+        # live behind the same hook; see prepare_pascal_source in
+        # parser_helpers.py for why they're wired in here rather than as
+        # ad-hoc if-blocks.
         # ``content_hash`` above deliberately hashes the ORIGINAL bytes, so
         # incremental update still tracks the real file.
         original_source = source
-        source = prepare_source(lang, source)
+        source = prepare_source(lang, source, path=file_info.path)
 
         parser = Parser(language)
         tree = parser.parse(source)
@@ -465,6 +475,10 @@ class ASTParser:
     ) -> list[Symbol]:
         symbols: list[Symbol] = []
         seen: set[tuple[int, str]] = set()  # (start_line, name) — dedup decorated dupes
+        # Parallel to ``symbols`` (same indices) -- only populated/consumed
+        # for Pascal, to dedupe interface-declaration vs. implementation
+        # method pairs after the loop. See _dedupe_pascal_interface_symbols.
+        node_types: list[str] = []
 
         # Deferred-export names (``export { x }`` / ``export default x``),
         # computed once per file for the TS/JS visibility refinement.
@@ -564,7 +578,27 @@ class ASTParser:
             # with no letters (``_``, ``__all__``) fall to "variable" rather
             # than being mislabelled constants by ``name == name.upper()``.
             if node_type in _MODULE_ANCHORED_NODE_TYPES:
-                kind = "constant" if name.isupper() else "variable"
+                # TS/JS: the symbol query admits call_expression values so
+                # forwardRef / memo / onCall / styled() bindings exist at all,
+                # which also lets `const svc = require('./svc')` through. Those
+                # bind a module and are already imports — drop them here rather
+                # than in the query, which cannot see past the await / paren /
+                # non-null / member-pick shells.
+                if file_info.language in _TS_JS_LANGUAGES and declarator_value_is_module_ref(
+                    def_node, src
+                ):
+                    continue
+                # A declarator whose value is structurally callable is not
+                # data, whatever its name looks like: `const C =
+                # forwardRef(fn)` and `const f = function(){}` are a component
+                # and a function. Naming decides only for the rest, which is
+                # what it was ever able to answer.
+                callable_kind = (
+                    declarator_binds_callable(def_node, src)
+                    if file_info.language in _TS_JS_LANGUAGES
+                    else None
+                )
+                kind = callable_kind or ("constant" if name.isupper() else "variable")
 
             # Params signature text
             params_text = _node_text(params_nodes[0], src) if params_nodes else ""
@@ -590,6 +624,41 @@ class ASTParser:
                                 rust_attrs.append(attr_text[2:-1])
                             k -= 1
                         break
+
+            # C#: [Obsolete] / [System.Obsolete] are ``attribute_list`` nodes.
+            # In tree-sitter-c-sharp the attribute_list is child[0] of the
+            # declaration node itself (method_declaration, class_declaration, etc.),
+            # NOT a preceding sibling in the class body. Iterate def_node.children
+            # and collect attribute_list nodes until the first non-attribute child.
+            # Strip the outer [ ] so the inner content matches the same
+            # _DEPRECATED_DECORATOR_BASES the analyzer uses for every other lang.
+            csharp_attrs: list[str] = []
+            if file_info.language == "csharp":
+                for child in def_node.children:
+                    if child.type != "attribute_list":
+                        break
+                    attr_text = _node_text(child, src).strip()
+                    # "[Obsolete]" → "Obsolete"
+                    if attr_text.startswith("[") and attr_text.endswith("]"):
+                        csharp_attrs.append(attr_text[1:-1])
+
+            # C/C++: [[deprecated]] / [[deprecated("reason")]] are
+            # ``attribute_declaration`` nodes. In tree-sitter-cpp the
+            # attribute_declaration is child[0] of function_definition itself
+            # (NOT a preceding sibling at translation_unit level). Iterate
+            # def_node.children and collect attribute_declaration nodes until
+            # the first non-attribute child.
+            # Strip the outer [[ ]] so the inner content lands in the same
+            # checker as the Rust and C# forms.
+            cpp_attrs: list[str] = []
+            if file_info.language in ("cpp", "c"):
+                for child in def_node.children:
+                    if child.type != "attribute_declaration":
+                        break
+                    attr_text = _node_text(child, src).strip()
+                    # "[[deprecated]]" → "deprecated"
+                    if attr_text.startswith("[[") and attr_text.endswith("]]"):
+                        cpp_attrs.append(attr_text[2:-2])
 
             visibility = config.visibility_fn(name, modifier_texts)
             is_exported_symbol = False
@@ -628,6 +697,15 @@ class ASTParser:
             if parent_name is None and file_info.language in ("cpp", "c") and name_nodes:
                 parent_name = _qualified_cpp_parent(name_nodes[0], src)
 
+            # Pascal out-of-line implementation: ``function TFoo.Bar(...);``
+            # -- the ``defProc`` node lives in the unit's implementation
+            # section, outside the class's ``declType`` body declared in the
+            # interface section, so nesting-based ``_find_parent`` above
+            # can't see it. The qualifying class lives beside the captured
+            # name in the ``genericDot`` header instead.
+            if parent_name is None and file_info.language == "pascal" and name_nodes:
+                parent_name = _qualified_pascal_parent(name_nodes[0], src)
+
             # Upgrade function → method when a parent class is detected
             if parent_name and kind == "function":
                 kind = "method"
@@ -658,7 +736,12 @@ class ASTParser:
                     start_line=start_line,
                     end_line=end_line,
                     docstring=docstring,
-                    decorators=[m for m in modifier_texts if m.startswith("@")] + rust_attrs,
+                    decorators=(
+                        [m for m in modifier_texts if m.startswith("@")]
+                        + rust_attrs
+                        + csharp_attrs
+                        + cpp_attrs
+                    ),
                     visibility=visibility,  # type: ignore[arg-type]
                     is_async=is_async,
                     language=file_info.language,
@@ -666,6 +749,10 @@ class ASTParser:
                     is_exported_symbol=is_exported_symbol,
                 )
             )
+            node_types.append(node_type)
+
+        if file_info.language == "pascal":
+            symbols = _dedupe_pascal_interface_symbols(symbols, node_types)
 
         return symbols
 
@@ -721,6 +808,7 @@ class ASTParser:
     ) -> list[Import]:
         imports: list[Import] = []
         seen_raws: set[str] = set()
+        seen_pascal_units: set[str] = set()
 
         for capture_dict in matches:
             stmt_nodes = capture_dict.get("import.statement", [])
@@ -730,6 +818,42 @@ class ASTParser:
                 continue
 
             stmt_node = stmt_nodes[0]
+
+            # Pascal: `uses UnitA, UnitB, Ns.UnitC;` -- pascal.scm's
+            # unquantified pattern (see that file's comment on why) fires
+            # once PER moduleName, so a 3-unit clause arrives as 3 separate
+            # matches sharing one @import.statement span, each carrying a
+            # single-element ``module_nodes``. Handled before the
+            # ``seen_raws`` dedup below: that guard exists to skip a
+            # statement re-matched by an *overlapping* pattern (the normal
+            # case elsewhere), but here every match legitimately carries a
+            # different unit despite the identical raw statement text --
+            # dedup-by-raw would keep only the first and silently drop the
+            # rest, which is exactly the bug this branch fixes.
+            #
+            # Deduped separately by unit name (case-insensitive -- Pascal
+            # identifiers are): a unit named in both the ``interface`` and
+            # ``implementation`` ``uses`` clauses of the same file is a
+            # single logical dependency and must not become two Import
+            # entries for it.
+            if file_info.language == "pascal":
+                raw = _node_text(stmt_node, src).strip()
+                unit_name = _node_text(module_nodes[0], src).strip()
+                if unit_name and unit_name.lower() not in seen_pascal_units:
+                    seen_pascal_units.add(unit_name.lower())
+                    imports.append(
+                        Import(
+                            raw_statement=raw,
+                            module_path=unit_name,
+                            imported_names=[],
+                            is_relative=False,
+                            resolved_file=None,
+                            bindings=[],
+                            is_reexport=False,
+                        )
+                    )
+                continue
+
             raw = _node_text(stmt_node, src).strip()
             if raw in seen_raws:
                 continue
@@ -799,9 +923,11 @@ class ASTParser:
             # call_expression, which would otherwise fall into the CommonJS
             # branch below and be dropped on the floor — a dynamic import
             # holds no ``require()`` for ``collect_cjs_requires`` to find.
-            # ``imported_names`` is empty because the construct binds a module
-            # namespace at runtime, not a static name; the file-to-file edge is
-            # what reachability needs.
+            # The construct binds a module namespace at runtime, so record a
+            # wildcard rather than a static name.  Downstream unused-export
+            # analysis treats ``*`` as namespace consumption and therefore
+            # keeps the target's exports live without a broad analyzer
+            # exemption.
             if (
                 file_info.language in _TS_JS_LANGUAGES
                 and stmt_node.type == "call_expression"
@@ -812,7 +938,7 @@ class ASTParser:
                     Import(
                         raw_statement=raw,
                         module_path=module_text,
-                        imported_names=[],
+                        imported_names=["*"],
                         is_relative=module_text.startswith("."),
                         resolved_file=None,
                         bindings=[],

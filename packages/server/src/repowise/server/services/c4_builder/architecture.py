@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from repowise.core.ids import ExternalSystemId, file_path_of, render
+from repowise.core.ingestion.models import CONTAINMENT_EDGE_TYPES
 from repowise.core.persistence import (
     ExternalSystem,
     GraphEdge,
@@ -58,13 +59,10 @@ _ENTRY_POINT_NAMES = frozenset(
     }
 )
 
-_SYMBOL_EDGE_TYPES = frozenset(
-    {
-        "contains",
-        "defines",
-        "has_method",
-    }
-)
+# "contains" used to sit here too. It is a knowledge-graph *export* label
+# derived from defines/has_method, never a persisted edge_type, so it matched
+# nothing.
+_SYMBOL_EDGE_TYPES = CONTAINMENT_EDGE_TYPES
 
 _EXT_MAP = {
     ".py": "python",
@@ -170,7 +168,10 @@ def _load_knowledge_graph(path: str) -> dict | None:
     if not path or not os.path.isfile(path):
         return None
     try:
-        with open(path) as f:
+        # Explicit utf-8: a bare open() decodes with the locale codec, so on a
+        # default Windows install a non-ASCII knowledge graph cost the whole
+        # C4 architecture view via the handler below.
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         logger.warning("kg_file_unreadable path=%s", path, exc_info=True)
@@ -449,9 +450,22 @@ async def build_architecture_view(
     edge_result = await session.execute(select(GraphEdge).where(GraphEdge.repository_id == repo_id))
     all_edges: list[GraphEdge] = list(edge_result.scalars())
 
+    # The edges this view actually returns. Degree is counted from the same
+    # list the arrows are drawn from: counting every row instead made one
+    # response disagree with itself, because a file's out-degree included the
+    # `defines` edge to each symbol it declares and none of those are shown
+    # when symbols are excluded.
+    view_edges = [
+        e
+        for e in all_edges
+        if (include_symbols or e.edge_type not in _SYMBOL_EDGE_TYPES)
+        and e.source_node_id in node_id_set
+        and e.target_node_id in node_id_set
+    ]
+
     in_degree: dict[str, int] = defaultdict(int)
     out_degree: dict[str, int] = defaultdict(int)
-    for e in all_edges:
+    for e in view_edges:
         out_degree[e.source_node_id] += 1
         in_degree[e.target_node_id] += 1
 
@@ -587,16 +601,12 @@ async def build_architecture_view(
 
     # -- Build ArchEdges --
     arch_edges: list[ArchEdge] = []
-    for e in all_edges:
-        if not include_symbols and e.edge_type in _SYMBOL_EDGE_TYPES:
-            continue
-        if e.source_node_id not in node_id_set or e.target_node_id not in node_id_set:
-            continue
+    for e in view_edges:
         arch_edges.append(
             ArchEdge(
                 source=e.source_node_id,
                 target=e.target_node_id,
-                edge_type=e.edge_type or "imports",
+                edge_type=e.edge_type,
                 direction="forward",
                 weight=e.confidence,
                 confidence=e.confidence,

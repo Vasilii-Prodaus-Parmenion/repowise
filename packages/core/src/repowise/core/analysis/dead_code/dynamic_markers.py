@@ -17,10 +17,10 @@ in Phase 2 stays mechanical.
 
 from __future__ import annotations
 
-import locale
 from pathlib import Path
 
 from repowise.core.ids import is_external
+from repowise.core.ingestion.models import is_dynamic_edge
 
 
 def read_source_text(
@@ -35,18 +35,20 @@ def read_source_text(
     ``source_map`` (keyed by the same repo-relative path as ``parsed_files``),
     so a hit here replaces a full-repo disk pass with a dict lookup.
 
-    Decoding is deliberately identical on both paths, and identical to the
-    ``Path.read_text(errors="ignore")`` these prepasses used to call, which
-    resolves ``encoding=None`` to the locale encoding at call time. Every
-    marker is ASCII, but pinning the codec keeps a source_map hit and a disk
-    fallback from ever disagreeing about the same bytes.
+    Decoding is deliberately identical on both paths, so a ``source_map`` hit
+    and a disk fallback can never disagree about the same bytes. The codec is
+    utf-8, not the locale's: this used to pin ``getpreferredencoding()`` to
+    reproduce the ``Path.read_text(errors="ignore")`` the prepasses called,
+    but that call was itself the bug: source files are utf-8, and the locale
+    codec is cp1252 on a default Windows install. Every marker is ASCII, so no
+    marker match changes; the surrounding text stops being mojibake.
     """
     data: bytes | None = None
     if source_map is not None:
         data = source_map.get(rel_path)
     if data is None:
         data = Path(abs_path).read_bytes()
-    return data.decode(locale.getpreferredencoding(False), errors="ignore")
+    return data.decode("utf-8", errors="ignore")
 
 
 # Patterns in source that indicate dynamic/runtime imports, keyed by suffix.
@@ -514,8 +516,7 @@ def find_dynamic_edge_files(graph) -> set[str]:
     result: set[str] = set()
     try:
         for u, v, data in graph.edges(data=True):
-            etype = data.get("edge_type", "")
-            if etype != "dynamic" and not etype.startswith("dynamic_"):
+            if not is_dynamic_edge(data.get("edge_type", "")):
                 continue
             for endpoint in (u, v):
                 if endpoint is None:

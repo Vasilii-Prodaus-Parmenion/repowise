@@ -42,6 +42,7 @@ from .nim import SPEC as _NIM
 from .objectivec import SPEC as _OBJECTIVEC
 from .ocaml import SPEC as _OCAML
 from .openapi import SPEC as _OPENAPI
+from .pascal import SPEC as _PASCAL
 from .php import SPEC as _PHP
 from .proto import SPEC as _PROTO
 from .python import SPEC as _PYTHON
@@ -98,6 +99,7 @@ ALL_SPECS: tuple[LanguageSpec, ...] = (
     _SWIFT,
     _SCALA,
     _DART,
+    _PASCAL,
     # -----------------------------------------------------------------
     # Config / data / markup languages (passthrough — no AST)
     # -----------------------------------------------------------------

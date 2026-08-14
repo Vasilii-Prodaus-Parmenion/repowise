@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from repowise.core.generation.entry_points import orientation_entry_points
+
 _log = logging.getLogger(__name__)
 
 #: Schema version of the ``knowledge-graph.json`` artifact. Bump whenever a
@@ -203,14 +205,31 @@ def _slugify(text: str) -> str:
 # Edge type mapping
 # ---------------------------------------------------------------------------
 
+# An unmapped type is dropped from the export entirely (see the
+# `if not kg_type: continue` below), which is silent. Six real types used to be
+# missing — framework, the three dynamic_* kinds, reads and method_implements —
+# so framework-wired and dynamically-dispatched relations never reached the
+# knowledge graph at all. `test_edge_type_map_covers_the_vocabulary` keeps this
+# total over every dependency type.
+#
+# `co_changes` is the one deliberate omission: it is git history, not a code
+# reference, and the export has no relation kind that would keep that
+# distinction downstream. Admitting it here is how a co-change partner starts
+# looking like an import.
 _EDGE_TYPE_MAP: dict[str, str] = {
     "imports": "imports",
     "type_use": "imports",
+    "framework": "imports",
+    "dynamic_imports": "imports",
+    "dynamic_uses": "depends_on",
+    "dynamic_url_route": "depends_on",
     "defines": "contains",
     "has_method": "contains",
     "calls": "depends_on",
     "extends": "depends_on",
     "implements": "depends_on",
+    "method_implements": "depends_on",
+    "reads": "depends_on",
 }
 
 
@@ -243,7 +262,7 @@ def build_knowledge_graph_skeleton(
         "name": repo_path.name if repo_path else "",
         "is_monorepo": repo_structure.is_monorepo if repo_structure else False,
         "total_files": repo_structure.total_files if repo_structure else len(parsed_files),
-        "entry_points": list(repo_structure.entry_points) if repo_structure else [],
+        "entry_points": orientation_entry_points(repo_structure),
         "tech_stack": tech_stack[:20],
     }
 

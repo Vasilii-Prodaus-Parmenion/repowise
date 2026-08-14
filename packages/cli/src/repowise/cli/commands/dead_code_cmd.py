@@ -14,6 +14,7 @@ from repowise.cli.helpers import (
     run_async,
     silence_logs_for_machine_output,
 )
+from repowise.cli.output import notice_console
 from repowise.core.analysis.dead_code.risk_factors import RISK_CAP_CONFIDENCE
 
 
@@ -110,7 +111,8 @@ def dead_code_command(
         no_workspace_flag=no_workspace,
         repo_alias=repo_alias,
     )
-    target.notice(console, command="dead-code")
+    notices = notice_console(fmt)
+    target.notice(notices, command="dead-code")
 
     if target.is_workspace:
         if target.repo_filter is not None:
@@ -123,12 +125,12 @@ def dead_code_command(
             if primary is None:
                 raise click.ClickException("Workspace has no primary repo configured.")
             repo_path = primary
-            console.print("[dim]  (Tip: pass --repo <alias> to analyze a different repo.)[/dim]")
+            notices.print("[dim]  (Tip: pass --repo <alias> to analyze a different repo.)[/dim]")
     else:
         assert target.repo_path is not None
         repo_path = target.repo_path
 
-    console.print(f"[bold]repowise dead-code[/bold] — {repo_path}")
+    notices.print(f"[bold]repowise dead-code[/bold] — {repo_path}")
 
     # Ingest — honor the persisted submodule flags so the analyzed file set
     # matches what `init` indexed (a flagless traverser on a submodule-indexed
@@ -256,6 +258,12 @@ def dead_code_command(
             safe = " (cleanup-ready)" if f.safe_to_delete else ""
             name = f"`{f.symbol_name}`" if f.symbol_name else f"`{f.file_path}`"
             click.echo(f"- [{f.kind.value}] {name} — {f.reason} ({f.confidence:.0%}){safe}")
+        if report.hidden_below_threshold:
+            click.echo(
+                f"\n> {report.hidden_below_threshold} finding(s) hidden below threshold "
+                f"(confidence < {min_confidence:.2g}); "
+                f"pass `--min-confidence 0.0` to see them."
+            )
         return
 
     # Table format (default)
@@ -292,3 +300,9 @@ def dead_code_command(
         f"\nCleanup-candidate lines: [bold]{report.deletable_lines:,}[/bold]"
         + (f" ({tiers} confidence)" if tiers else "")
     )
+    if report.hidden_below_threshold:
+        console.print(
+            f"[dim]{report.hidden_below_threshold} finding(s) hidden below "
+            f"threshold (confidence < {min_confidence:.2g}); "
+            f"pass --min-confidence 0.0 to see them.[/dim]"
+        )

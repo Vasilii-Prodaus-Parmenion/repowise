@@ -4,6 +4,61 @@ The `.repowise/` directory, provider setup, API keys, and what's customizable.
 
 ---
 
+## Contents
+
+**Files and `config.yaml`**
+[The `.repowise/` directory](#the-repowise-directory) ·
+[`config.yaml`](#configyaml) ·
+[Grounded generation context](#grounded-generation-context) ·
+[The `distill:` block](#the-distill-block) ·
+[The `hooks:` block](#the-hooks-block) ·
+[The `mcp:` block](#the-mcp-block) ·
+[The `decisions:` block](#the-decisions-block) ·
+[The `refactoring:` block](#the-refactoring-block)
+
+**Code health rules**
+[The `health-rules.json` file](#the-health-rulesjson-file)
+
+**LLM providers**
+[Overview](#llm-providers) ·
+[Anthropic](#anthropic-claude) ·
+[OpenAI](#openai-gpt) ·
+[OpenRouter](#openrouter) ·
+[Gemini](#gemini-google) ·
+[DeepSeek](#deepseek) ·
+[Kimi](#kimi) ·
+[Ollama](#ollama-local-no-api-key) ·
+[LiteLLM](#litellm-100-providers) ·
+[Provider auto-detection](#provider-auto-detection)
+
+**Embeddings and keys**
+[Embeddings (for semantic search)](#embeddings-for-semantic-search) ·
+[BYOK (Bring Your Own Key)](#byok-bring-your-own-key)
+
+**Environment variables**
+[Overview](#environment-variables) ·
+[Provider API keys](#provider-api-keys) ·
+[Provider base URLs](#provider-base-urls) ·
+[Provider and model overrides](#provider-and-model-overrides) ·
+[Embeddings](#embeddings) ·
+[Server and database](#server-and-database) ·
+[Telemetry](#telemetry) ·
+[Misc](#misc)
+
+**Repo scope**
+[Exclude patterns](#exclude-patterns) ·
+[Submodules](#submodules) ·
+[PostgreSQL](#postgresql)
+
+**Workspace**
+[Workspace config (`.repowise-workspace.yaml`)](#workspace-config-repowise-workspaceyaml) ·
+[The `conformance:` block](#the-conformance-block)
+
+**Reference**
+[Deprecated / legacy aliases](#deprecated--legacy-aliases)
+
+---
+
 ## The `.repowise/` directory
 
 Everything repowise knows about your repository lives here. It's created at the
@@ -188,12 +243,16 @@ the partial page instead of saving it.
 `wiki_style` controls the voice and density of generated wiki pages. Set it with
 `init --wiki-style` or switch later with `repowise restyle <style>` (which also
 regenerates the wiki). Power users can define their own style under
-`.repowise/styles/<name>/style.yaml`. Full guide: [WIKI_STYLES.md](../layers/WIKI_STYLES.md).
+`.repowise/styles/<name>/style.yaml`. Full guide: [WIKI.md](../layers/WIKI.md#styles).
 Note: hand-editing `wiki_style` here and running `update` does not regenerate
 existing pages, use `restyle`.
 
-`language` controls the natural language of generated wiki content (prose only;
-code, file paths, and symbol names stay untranslated). Set it with
+`language` controls the natural language of generated wiki content (code, file
+paths, and symbol names stay untranslated). It reaches both the model-written
+pages and the headings and fixed sentences of the template-rendered ones — file,
+symbol, infrastructure, cycle and API-contract pages — for the languages that
+have a label catalog. A language without one keeps the English headings on those
+pages while the model-written prose is still translated. Set it with
 `init --language <code>` or pick it in advanced interactive mode; it persists
 here so `update` regenerates changed pages in the same language. Unknown codes
 fall back to English with a warning. As with `wiki_style`, changing it later
@@ -571,8 +630,9 @@ store would be rebuilt from scratch, discarding what the reindex just built.
 
 `REPOWISE_EMBEDDING_MODEL` overrides the model for whichever embedder is
 active. `REPOWISE_EMBEDDING_DIMS` and `REPOWISE_EMBEDDING_TIMEOUT` apply the
-same way; the `OLLAMA_EMBEDDING_*` variants below are Ollama-specific
-equivalents.
+same way; the provider-prefixed variants below (`OPENAI_*`, `GEMINI_*`,
+`OLLAMA_*`, `OPENROUTER_*`) narrow a setting to one embedder and take
+precedence over the shared name.
 
 ---
 
@@ -632,10 +692,13 @@ The `.repowise/.env` file is gitignored automatically.
 | `REPOWISE_EMBEDDER` | Embedder: `gemini`, `openai`, `ollama`, `openrouter`, or `mock` |
 | `REPOWISE_EMBEDDING_MODEL` | Embedding model, applies to any embedder |
 | `REPOWISE_EMBEDDING_DIMS` | Embedding output dimensions (optional; inferred from the model otherwise) |
-| `REPOWISE_EMBEDDING_TIMEOUT` | Embed request timeout in seconds |
+| `REPOWISE_EMBEDDING_TIMEOUT` | Embed request timeout in seconds (default: `30` for `ollama`, `10` elsewhere). Raise it for a local endpoint — one request embeds a whole batch, and an expired batch is reported only as `N/N items failed to embed`. An unparseable value warns and keeps the default |
+| `OPENAI_EMBEDDING_TIMEOUT` | As above, `openai` only; takes precedence over the shared variable |
+| `GEMINI_EMBEDDING_TIMEOUT` | As above, `gemini` only |
+| `OPENROUTER_EMBEDDING_TIMEOUT` | As above, `openrouter` only |
 | `OLLAMA_EMBEDDING_MODEL` | Ollama embedding model (also selects the `ollama` embedder) |
 | `OLLAMA_EMBEDDING_DIMS` | Ollama embedding output dimensions (optional; inferred from the model otherwise) |
-| `OLLAMA_EMBEDDING_TIMEOUT` | Ollama embed request timeout in seconds (default: `30`); raise it for long pages on slow local models |
+| `OLLAMA_EMBEDDING_TIMEOUT` | As above, `ollama` only; raise it for long pages on slow local models |
 
 ### Server and database
 

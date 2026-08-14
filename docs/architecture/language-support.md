@@ -341,6 +341,95 @@ in shape for exactly that reason.
 
 ---
 
+## Single-file components
+
+`<script>` blocks in markup files (Svelte `.svelte`, Vue `.vue`) pose a 
+challenge: the script contains the code — symbols, imports, calls — but it's 
+nested inside a markup tree, and a tree-sitter grammar for the component as a 
+whole would be a third grammar to maintain.
+
+Instead, there's a simpler projection:
+
+1. a markup grammar *locates* the JS-bearing regions — every `<script>` body
+   and every markup expression;
+2. every byte outside those regions is blanked to a space, with newlines kept;
+3. each kept markup expression is fenced by rewriting its two surrounding
+   delimiter bytes to `;`, so adjacent expressions cannot run together and an
+   unterminated final script statement cannot swallow the following expression
+   via ASI.
+
+The result is valid TypeScript whose every byte offset and line number matches
+the original file. That single property is what makes the rest free: the spec
+declares `shares_grammar_with="typescript"` and `scm_file="typescript.scm"`, the
+`LanguageConfig` is an alias of TypeScript's, and the three health dialect
+registries alias the TS entries. Each consumer that hands raw bytes to a
+tree-sitter `Parser` calls `prepare_source(language, source, path=abs_path)`
+first — the ingestion parser plus the complexity, dataflow, and duplication
+walkers. It is a no-op for every language without a registered locator or
+sanitizer.
+
+`prepare_source` also carries per-language byte-preserving sanitizers that
+aren't about multi-language files at all — a construct a grammar can't parse,
+where hitting it corrupts everything downstream. Object Pascal is the current
+example: `.dpr`/`.dpk`/`.lpr` project files write `unit in 'path.pas'` clauses
+in their `uses` list, a syntax tree-sitter-pascal has no rule for, and hitting
+one used to corrupt every unit named after it in the same clause. Its
+sanitizer (`prepare_pascal_source` in `ingestion/parser_helpers.py`) is gated
+on `path`'s extension — that syntax is invalid in a plain `.pas`/`.pp` unit
+file — and is a no-op everywhere else, same contract as the `_LOCATORS` path.
+Registering a sanitizer this way, rather than as an if-block in `parser.py`,
+means it stays "zero changes to `parser.py`" for a new language and the health
+walkers get the same clean projection the ingestion parser does.
+
+### The locator registry
+
+Only step 1 differs per language, so it lives behind `_LOCATORS`, a dict of
+`Locator(grammar_module, visit, component_name)`. The blanking, fencing,
+caching and offset invariants are shared; adding a markup language means adding
+a `Locator`, not a second copy of the walker.
+
+| | Svelte | Vue |
+|---|---|---|
+| Grammar | `tree-sitter-svelte` | `tree-sitter-html` |
+| Expression nodes | `svelte_raw_text` under `expression` / `if_start` / `key_start` / `html_tag` | `attribute_value` inside `quoted_attribute_value`; `{{ … }}` scanned inside `text` |
+| Fence bytes | the surrounding `{` `}` | the surrounding `"` or `'` |
+| Skipped binding forms | `{#each}`, `{#await}` heads | `v-for`, `v-slot` / `#default` |
+| Non-component tags | the `svelte:*` namespace | `<KeepAlive>`, `<Transition>`, `<RouterView>`, … in either spelling |
+
+There is no `tree-sitter-vue` on PyPI. The HTML grammar parses a Vue SFC
+cleanly anyway, because `<template>`, `<script>` and `<style>` are ordinary
+elements to it — so one dependency covers both Vue and plain HTML.
+
+**Plain HTML deliberately has no locator.** It reuses the same grammar but not
+the projection, and the distinction is the point: a projection exists to turn a
+`<script>` block into analysable TypeScript, which is worth it when that block
+is where the component lives. A plain `.html` file's inline script almost never
+carries a module import — 13 of the 6162 `.html` files in the validation corpus
+(0.2%) — so projecting would buy a rounding error and would mint symbols,
+contradicting HTML's import-only tier. Its `<script src>` / `<link href>`
+attributes are read directly in
+`lightweight_imports/html.py`, which is extractor work, not projection work.
+Adding a `Locator` for HTML purely for symmetry with Vue and Svelte would be a
+mistake; `_LOCATORS` is for languages whose *script blocks* need projecting.
+
+Vue's expressions live in attribute *values*, which is why the fence bytes are
+quotes rather than braces, and why only directive attributes (`:`, `@`, `v-`)
+are projected: `class="btn primary"` is a literal string, and projecting it
+would put two juxtaposed identifiers at statement position.
+
+Two things markup carries that the projection cannot express are minted
+separately: the component symbol itself (via
+`extractors/synthetic_symbols/sfc_component.py`, since the filename is the only
+thing that names a component) and `<Foo />` instantiation call edges (via
+`component_call_sites`, the analogue of `tsx.scm`'s JSX captures). For Vue both
+run the filename and the tag through the *same* normaliser, so
+`back-to-top.vue` and `<back-to-top />` cannot disagree about the name
+`BackToTop`.
+
+The same steps would fit Astro components; only the locator changes.
+
+---
+
 ## Optional language-specific passes
 
 Several pluggable hooks let a language opt into deeper resolution without

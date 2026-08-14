@@ -1,7 +1,7 @@
 # Language Support
 
-repowise parses **17 languages to a full AST**, resolves imports and call
-graphs across them, and scores **12 at the Full tier** with code-health markers.
+repowise parses **19 languages to a full AST**, resolves imports and call
+graphs across them, and scores **13 at the Full tier** with code-health markers.
 Everything else in your repo is still tracked through git history and appears in
 the wiki. This page is the "what works for my language today" reference.
 
@@ -9,6 +9,12 @@ the wiki. This page is the "what works for my language today" reference.
 > [architecture/language-support.md](../architecture/language-support.md). Adding
 > a language needs one `.scm` query file and one config entry, with no changes
 > to the parser core.
+
+**Contents:** [Tiers at a glance](#tiers-at-a-glance) ·
+[Full tier](#full-tier) · [Good tier](#good-tier) · [SQL + dbt](#sql--dbt) ·
+[Lightweight, Partial, Structural](#lightweight-partial-and-structural-tiers) ·
+[Code-health coverage](#code-health-coverage) · [Roadmap](#roadmap) ·
+[See also](#see-also)
 
 ---
 
@@ -19,15 +25,14 @@ produce meaningful output.
 
 | Tier | Languages | What works |
 |------|-----------|------------|
-| **Full** | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby · VB.NET⁴ | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
-| **Full** | Python · TypeScript · JavaScript · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby · VB.NET³ | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
-| **Good** | C · Swift · PHP · Dart | Everything above except code-health markers (C, Swift, PHP; Dart *does* get health markers). Dedicated workspace resolvers and framework edges per language |
-| **SQL / dbt** | `.sql` via sqlglot | Tables / views / functions / procedures as symbols with wiki pages; dbt projects get real `ref()` / `source()` lineage |
+| [**Full**](#full-tier) | Python · TypeScript · JavaScript · Svelte · Vue · Java · Kotlin · Go · Rust · C++ · C# · Scala · Ruby · VB.NET | AST parsing, import resolution, named bindings, call resolution, heritage, docstrings, framework-aware edges, dynamic-hint extractors, and **code-health markers** |
+| [**Good**](#good-tier) | C · Swift · PHP · Dart · Object Pascal | Everything above except code-health markers (C, Swift, PHP, Object Pascal; Dart *does* get health markers). Dedicated workspace resolvers and framework edges per language, except Object Pascal, which resolves imports via the generic stem-map fallback (see [Known gaps](#object-pascal-known-gaps)) |
+| [**SQL / dbt**](#sql--dbt) | `.sql` via sqlglot | Tables / views / functions / procedures as symbols with wiki pages; dbt projects get real `ref()` / `source()` lineage |
 | **Shell** | `.sh` `.bash` `.zsh` | Function definitions as symbols, `source` / `.` import edges (incl. `$SCRIPT_DIR` / `dirname` / `$BATS_ROOT` idioms), and function-level code-health complexity (CCN, nesting, cognitive). No class metrics, heritage, bindings, or dead-code flagging |
 | **Config / data** | OpenAPI · Protobuf · GraphQL · Dockerfile · Makefile · YAML · JSON · TOML · Terraform · Markdown | In the file tree and wiki; special handlers extract endpoints / targets where applicable |
-| **Lightweight** | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML | File-level import graph only (no symbols/calls). Honest file-to-file dependencies, no symbol-level claims |
-| **Partial** | Luau / Roblox | AST symbols + `require()` resolution (Rojo / `.luaurc` aware); no health markers yet |
-| **Structural** | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only (blame, hotspots, co-change). No AST parsing |
+| [**Lightweight**](#lightweight-partial-and-structural-tiers) | Elixir · Clojure · Haskell · Lean 4 · Erlang · F# · HTML | File-level import graph only (no symbols/calls). Honest file-to-file dependencies, no symbol-level claims |
+| [**Partial**](#lightweight-partial-and-structural-tiers) | Luau / Roblox | AST symbols + `require()` resolution (Rojo / `.luaurc` aware); no health markers yet |
+| [**Structural**](#lightweight-partial-and-structural-tiers) | Objective-C · R · Zig · Julia · Elm · OCaml · Crystal · Nim · D | Git history only (blame, hotspots, co-change). No AST parsing |
 
 **Pipeline stage coverage:**
 
@@ -87,12 +92,9 @@ extractors, and code-health markers.
 | **Ruby** | `.rb` | `require` / `require_relative` with `$LOAD_PATH` probing, Gemfile externals, RSpec mirror edges, Rails / Zeitwerk autoloading |
 | **VB.NET** | `.vb` | `Imports` (incl. aliases) via the shared dotnet resolver stack — `.vbproj` `RootNamespace` + project-level `Imports`, `ProjectReference` graph shared with C#, case-insensitive same-namespace pass |
 
-The first eleven also support three-tier call resolution (same-file,
-cross-file, global stem match) and docstring extraction (Python, Ruby
-comments, JSDoc, GoDoc, Rustdoc, Javadoc, Scaladoc, Doxygen, XML doc).
-VB.NET resolves same-file and cross-file calls (case-insensitively, matching
-VB's own identifier semantics) but has no global stem-match tier yet; its XML
-`'''` doc comments reuse the same summary-extraction logic as C#.
+All thirteen also support three-tier call resolution (same-file, cross-file,
+global stem match) and docstring extraction (Python, Ruby comments, JSDoc,
+GoDoc, Rustdoc, Javadoc, Scaladoc, Doxygen, XML doc).
 
 **Single-file components** (`.svelte`, `.vue`) are three languages in one file,
 so they get a shared projection rather than a grammar of their own. A markup
@@ -179,6 +181,35 @@ mixins). Dedicated workspace resolvers per language.
 | **Swift** | `.swift` | `import` with SPM `Package.swift` target → directory mapping; intra-module type references; `@main` entry points |
 | **PHP** | `.php` | `use Foo\Bar\Baz` with composer.json PSR-4 longest-prefix resolution; Laravel, TYPO3 edges |
 | **Dart** | `.dart` | `import` / `export` / `part` URIs; `package:` via every `pubspec.yaml`; Flutter route tables and `runApp()` edges; **code-health markers** |
+| **Object Pascal** | `.pas` `.pp` `.dpr` `.dpk` `.lpr` `.inc` | `uses UnitA, UnitB;` resolved via the generic unit-name → file-stem fallback (no dedicated resolver); `.dpr`/`.dpk`/`.lpr` project files as entry points |
+
+### Object Pascal known gaps
+
+Delphi (`.pas`/`.dpr`/`.dpk`) and Free Pascal/Lazarus (`.pas`/`.pp`/`.lpr`) via
+`tree-sitter-pascal`. Newest AST-parsed language in this tier, so its ceilings
+are less battle-tested than C/Swift/PHP/Dart's:
+
+- **Type kind collapses to `"class"`.** `record` / `interface` / class-helper /
+  enum / plain type alias are all reported as `kind="class"` — the query
+  captures the declaration but not which of the five forms it is.
+- **`extends`/`implements` heritage split is best-effort.** Delphi's
+  `class(TBase, IFoo, IBar)` ancestor list doesn't itself distinguish a base
+  class from an implemented interface; the heritage extractor infers it from
+  naming convention (`I`-prefixed identifiers), which is the real-world Delphi
+  convention but not a language guarantee.
+- **No dedicated import resolver.** Unlike C/Swift/PHP/Dart, `uses` clauses
+  resolve through the same generic unit-name → file-stem fallback as the
+  Lightweight tier, rather than a project-file-aware resolver — accurate for
+  the near-universal "unit name equals file stem" convention, wrong when it
+  doesn't hold.
+- **No code-health markers yet** (complexity, duplication, dataflow dialects
+  aren't registered for Pascal).
+- **One known grammar gap left unhandled deliberately:** an anonymous
+  `array[...] of record ... end` element type has no tree-sitter-pascal rule
+  and degrades to a wrong `parent_name` for whatever the same class declares
+  afterward — contained to that one class, not fixed, since a correct fix
+  needs a nesting-aware scanner for one construct seen once in the validation
+  corpus. See `prepare_pascal_source` in `ingestion/parser_helpers.py`.
 
 ---
 

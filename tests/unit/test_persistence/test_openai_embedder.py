@@ -82,6 +82,45 @@ def test_malformed_env_raises_the_same_message(monkeypatch):
         OpenAIEmbedder(api_key="k", model="local-embedder")
 
 
+def test_timeout_from_shared_env(monkeypatch):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_TIMEOUT", "180")
+    assert OpenAIEmbedder(api_key="k", model="local-embedder")._timeout == 180.0
+
+
+def test_provider_env_beats_shared_env(monkeypatch):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_TIMEOUT", "180")
+    monkeypatch.setenv("OPENAI_EMBEDDING_TIMEOUT", "45")
+    assert OpenAIEmbedder(api_key="k", model="local-embedder")._timeout == 45.0
+
+
+def test_explicit_timeout_beats_env(monkeypatch):
+    monkeypatch.setenv("REPOWISE_EMBEDDING_TIMEOUT", "180")
+    assert OpenAIEmbedder(api_key="k", model="local-embedder", timeout=5)._timeout == 5.0
+
+
+def test_hosted_default_is_unchanged(monkeypatch):
+    # Pins the value, not the wiring: the env knob exists so this can stay put,
+    # since it also bounds the retried query path.
+    monkeypatch.delenv("REPOWISE_EMBEDDING_TIMEOUT", raising=False)
+    monkeypatch.delenv("OPENAI_EMBEDDING_TIMEOUT", raising=False)
+    assert OpenAIEmbedder(api_key="k")._timeout == 10.0
+
+
+@pytest.mark.parametrize("bad", ["abc", "30s", "0", "-5", "inf", "nan"])
+def test_a_malformed_env_value_falls_back_instead_of_breaking_the_run(monkeypatch, bad):
+    # build_embedder turns any construction error into a keyless 8-wide store,
+    # so raising here would make a typo silently destroy retrieval for setups
+    # that worked before the variable was honoured at all.
+    monkeypatch.setenv("REPOWISE_EMBEDDING_TIMEOUT", bad)
+    assert OpenAIEmbedder(api_key="k", model="local-embedder")._timeout == 10.0
+
+
+@pytest.mark.parametrize("bad", [0, -5, float("inf"), float("nan"), True, "30"])
+def test_an_invalid_explicit_timeout_raises(bad):
+    with pytest.raises(ValueError, match="timeout must be a positive number"):
+        OpenAIEmbedder(api_key="k", model="local-embedder", timeout=bad)
+
+
 # ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
@@ -211,8 +250,8 @@ async def test_embed_raises_when_api_returns_wrong_width_from_dims_table():
             await emb.embed(["hello"])
 
     msg = str(exc_info.value)
-    assert "3" in msg                   # actual width named
-    assert "_DIMS" in msg               # points at the table, not the user
+    assert "3" in msg  # actual width named
+    assert "_DIMS" in msg  # points at the table, not the user
 
 
 async def test_embed_raises_when_api_returns_wrong_width_with_user_override(monkeypatch):
@@ -220,7 +259,7 @@ async def test_embed_raises_when_api_returns_wrong_width_with_user_override(monk
     # message should reference REPOWISE_EMBEDDING_DIMS so they know what to change.
     monkeypatch.setenv("REPOWISE_EMBEDDING_DIMS", "512")
     emb = OpenAIEmbedder(api_key="k", model="text-embedding-3-small")
-    assert emb.dimensions == 512        # from env override
+    assert emb.dimensions == 512  # from env override
 
     with patch("openai.OpenAI") as mock_client:
         mock_client.return_value.embeddings.create.return_value = _make_mock_response(
@@ -239,4 +278,3 @@ async def test_embed_width_check_is_skipped_for_empty_response():
     # must not fire on the empty list itself.
     emb = OpenAIEmbedder(api_key="k")
     assert await emb.embed([]) == []
-

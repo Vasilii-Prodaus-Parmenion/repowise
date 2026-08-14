@@ -102,7 +102,22 @@ class InstrumentedGroup(click.Group):
     def invoke(self, ctx: click.Context):
         from repowise.cli.platform import telemetry
 
-        telemetry.maybe_show_notice()
+        # Not for ``uninstall``. Reading the consent state resolves
+        # ``~/.repowise/``, and that resolution creates the directory even on a
+        # pure read, so this ran before any command code and put back the
+        # directory the previous ``uninstall --all`` had deleted. The command
+        # then reported machine-wide state ``removed`` on every run, forever.
+        #
+        # Two other writes to the same directory had to be stopped for the same
+        # reason (the spool on the way out, the self-heal stamp in ``main``).
+        # This is the earliest of the three, which is why it survived them.
+        # Read from the unparsed args, not from ``ctx.invoked_subcommand``:
+        # Click sets that inside ``MultiCommand.invoke``, which is the call we
+        # are wrapping, so up here it is still None for every command and the
+        # guard silently never fired.
+        pending = getattr(ctx, "protected_args", None) or ctx.args
+        if not pending or pending[0] != "uninstall":
+            telemetry.maybe_show_notice()
 
         # The unparsed tail (subcommand + its args) is captured now, before
         # ``super().invoke`` may consume it.
@@ -132,6 +147,19 @@ class InstrumentedGroup(click.Group):
                 status = "interrupted"
             else:
                 status = "error"
+                # Mirror the ``Exit`` branch above and name the class, or this
+                # bucket records a failure with no error type at all. Commands
+                # that raise ``SystemExit`` directly rather than via
+                # ``ctx.exit()`` all land here, so leaving it unset loses the
+                # only diagnostic the event carries. Prefer the chained cause
+                # when there is one: a bare ``SystemExit(1)`` says nothing on
+                # its own, whereas the exception that forced the exit does.
+                # ``from None`` is honoured — a suppressed context is the
+                # author saying it is not the explanation.
+                cause = exc.__cause__
+                if cause is None and not exc.__suppress_context__:
+                    cause = exc.__context__
+                error_type = type(cause).__name__ if cause else "SystemExit"
             raise
         except (KeyboardInterrupt, click.exceptions.Abort):
             # User cancelled (Ctrl-C / declined a prompt). Not a failure — long-

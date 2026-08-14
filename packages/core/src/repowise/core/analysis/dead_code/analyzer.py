@@ -21,6 +21,7 @@ from typing import Any
 
 import structlog
 
+from ...ingestion.models import REACHABILITY_USE_EDGE_TYPES
 from .constants import (
     _DEFAULT_DYNAMIC_PATTERNS,
     _FRAMEWORK_DECORATOR_SUFFIXES,
@@ -31,18 +32,16 @@ from .constants import (
     _is_fixture_path,
 )
 from .contract_methods import is_contract_method
-from .cpp_reachability import (
-    build_cpp_package_files,
-    is_cpp_file_reachable,
-    is_cpp_path,
-)
 from .dynamic_markers import (
     find_dynamic_edge_files,
     find_dynamic_import_files,
     read_source_text,
 )
-from .go_reachability import build_go_package_files, is_go_file_reachable
-from .jvm_reachability import build_jvm_package_files, is_jvm_file_reachable
+from .file_reachability import (
+    ReachabilityRescues,
+    build_package_file_map,
+    is_file_reachable,
+)
 from .models import DeadCodeFindingData, DeadCodeKind, DeadCodeReport
 from .risk_factors import RISK_CAP_CONFIDENCE, path_risk_factors, risk_evidence
 
@@ -68,6 +67,120 @@ _IDENTIFIER_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{2,}")
 #: keeps it from ever becoming the expensive thing.
 _UNINDEXED_SCAN_PER_FILE_BYTES = 4 * 1024 * 1024
 _UNINDEXED_SCAN_TOTAL_BYTES = 32 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Deprecation detection
+# ---------------------------------------------------------------------------
+
+#: Normalised decorator/annotation bases (after stripping leading ``@`` and
+#: any call-argument ``(…)`` tail) that signal a symbol is deprecated.
+#:
+#: Rust inner-attr form (``deprecated``), C# stripped form (``Obsolete``), and
+#: C++ stripped form (``deprecated``) are included verbatim because the
+#: respective sibling-walk extractors in ``parser.py`` already strip the
+#: language-specific bracket pairs before storing.
+_DEPRECATED_DECORATOR_BASES: frozenset[str] = frozenset(
+    {
+        # Python / TypeScript / Scala / Swift
+        "deprecated",
+        "typing.deprecated",
+        "warnings.deprecated",
+        # Java / Kotlin (case-sensitive annotation names)
+        "Deprecated",
+        "kotlin.Deprecated",
+        "java.lang.Deprecated",
+        # C# (inner attr text after stripping [ ])
+        "Obsolete",
+        "System.Obsolete",
+        "System.ObsoleteAttribute",
+    }
+)
+
+
+#: Regex that strips quoted string literals from a decorator/annotation text
+#: before splitting on ``@`` boundaries.  Without this,
+#: ``@app.route("/deprecated")`` would produce a token whose paren-stripped
+#: base is ``app.route`` (correct), but a hypothetical annotation whose
+#: *argument* contains ``@something`` would create a spurious token.
+_QUOTED_STR_RE: re.Pattern[str] = re.compile(r'"[^"]*"')
+
+
+def _decorator_base(raw: str) -> str:
+    """Return the normalised base name of a single decorator/annotation token.
+
+    Strips a leading ``@``, trims whitespace, and drops any call-argument
+    ``(…)`` tail.  For multi-word tokens (e.g. a Java modifier blob fragment
+    ``"Deprecated\n    public"``) only the first whitespace-delimited word is
+    kept, so visibility keywords that trail the annotation name are discarded.
+
+    This function handles ONE token.  Callers that receive multi-annotation
+    blobs (Java/Kotlin ``modifiers`` node) must split on ``@`` first.
+    """
+    base = raw.lstrip("@").strip()
+    paren = base.find("(")
+    if paren >= 0:
+        base = base[:paren].strip()
+    else:
+        # Handle trailing visibility keywords in modifier blobs:
+        # "Deprecated\n    public" → "Deprecated"
+        parts = base.split()
+        base = parts[0] if parts else base
+    return base
+
+
+def _is_symbol_deprecated(sym_name: str, decorators: list[str]) -> bool:
+    """Return True when the symbol is marked deprecated by name suffix or annotation.
+
+    Two mechanisms are checked in order:
+
+    1. **Name suffix**: the name ends with ``_DEPRECATED``, ``_LEGACY``, or
+       ``_COMPAT`` (original naming-convention check, preserved for backward
+       compatibility).
+
+    2. **Decorator / annotation**: each entry in *decorators* is treated as a
+       possibly multi-annotation modifier blob (Java/Kotlin ``modifiers`` node
+       delivers all annotations concatenated with whitespace in a single
+       string).  Each entry is first cleaned of quoted substrings (to avoid
+       matching paths like ``"/deprecated"`` inside ``@app.route("/deprecated")``),
+       then split on ``@`` boundaries so every individual annotation is checked
+       independently.  Each token is normalised via :func:`_decorator_base` and
+       tested against ``_DEPRECATED_DECORATOR_BASES`` and the lower-cased
+       ``"deprecated"`` catch-all.
+
+    The *decorators* list is produced by ``parser.py`` ``_extract_symbols``:
+    - Python / Scala / Swift: full decorator text with leading ``@``
+      (e.g. ``"@deprecated"``, ``"@typing.deprecated"``).
+    - Java / Kotlin: full modifier-node text — one blob per declaration that
+      may contain several annotations plus visibility keywords
+      (e.g. ``"@Deprecated\n    public"``,
+      ``"@Override\n  @Deprecated\n  public"``).
+    - Rust: inner attribute content stripped of ``#[…]``
+      (e.g. ``"deprecated"`` from ``#[deprecated]``).
+    - C#: inner attribute content stripped of ``[…]``
+      (e.g. ``"Obsolete"`` from ``[Obsolete]``).
+    - C++: inner attribute content stripped of ``[[…]]``
+      (e.g. ``"deprecated"`` from ``[[deprecated]]``).
+    """
+    # 1. Name suffix
+    if any(sym_name.endswith(s) for s in ("_DEPRECATED", "_LEGACY", "_COMPAT")):
+        return True
+    # 2. Decorator / annotation
+    for raw in decorators:
+        # Strip quoted strings first so path arguments like "/deprecated"
+        # inside ``@app.route("/deprecated")`` do not create false tokens.
+        cleaned = _QUOTED_STR_RE.sub('""', raw)
+        # Split on '@' to tokenize modifier blobs.  A leading '@' produces
+        # an empty first element which the ``if not token`` guard discards.
+        # No-'@' forms (Rust/C#/C++ inner attrs: "deprecated", "Obsolete")
+        # yield a single token equal to the whole string.
+        for token in cleaned.split("@"):
+            token = token.strip()
+            if not token:
+                continue
+            base = _decorator_base(token)
+            if base in _DEPRECATED_DECORATOR_BASES or base.lower() == "deprecated":
+                return True
+    return False
 
 # Symbol kinds that cannot be independently imported by name in any
 # supported language. Flagging them as "unused exports" is a guaranteed
@@ -338,26 +451,6 @@ _CPP_BUILTIN_MACROS: frozenset[str] = frozenset(
 )
 
 logger = structlog.get_logger(__name__)
-
-# Re-export barrel filenames. Skipped in the *unreachable-file* pass only:
-# a barrel aggregates other modules' symbols and is reached by importing
-# those names (or, for a package's public entry, via package.json
-# ``exports``/``main``), so a barrel with no inbound graph edge is not dead.
-# They are NOT skipped in the unused-export pass — a genuine symbol defined
-# in a barrel that nobody imports should still be flagged.
-_BARREL_FILENAMES: frozenset[str] = frozenset(
-    {
-        "__init__.py",
-        "index.ts",
-        "index.tsx",
-        "index.js",
-        "index.jsx",
-        "index.mts",
-        "index.cts",
-        "index.mjs",
-        "index.cjs",
-    }
-)
 
 
 def _find_jsx_namespace_files(
@@ -652,32 +745,20 @@ class DeadCodeAnalyzer:
         self._ts_export_aliases: dict[str, dict[str, str]] = _find_ts_export_aliases(
             parsed_files or {}, source_map
         )
-        # Lazily-built ``.go`` package-directory → file-node map, used by the
-        # Go package-granular reachability hook (see ``go_reachability``).
-        self._go_package_files: dict[str, list[str]] | None = None
-        # Lazily-built JVM (``.java`` + ``.kt``) package-directory map; see
-        # :mod:`jvm_reachability`.
-        self._jvm_package_files: dict[str, list[str]] | None = None
-        # Lazily-built C/C++ directory map; see :mod:`cpp_reachability`.
-        self._cpp_package_files: dict[str, list[str]] | None = None
+        # Lazily-built rescue state for the shared reachability predicate: the
+        # package-directory maps for Go / JVM / C-C++ plus the bundler-alias
+        # targets found above. Built on first use so a graph that never
+        # reaches the unreachable-files pass never pays for it.
+        self._rescues: ReachabilityRescues | None = None
 
-    def _go_packages(self) -> dict[str, list[str]]:
-        """Return the cached Go package map, building it on first use."""
-        if self._go_package_files is None:
-            self._go_package_files = build_go_package_files(self.graph)
-        return self._go_package_files
-
-    def _jvm_packages(self) -> dict[str, list[str]]:
-        """Return the cached JVM package map, building it on first use."""
-        if self._jvm_package_files is None:
-            self._jvm_package_files = build_jvm_package_files(self.graph)
-        return self._jvm_package_files
-
-    def _cpp_packages(self) -> dict[str, list[str]]:
-        """Return the cached C/C++ directory map, building it on first use."""
-        if self._cpp_package_files is None:
-            self._cpp_package_files = build_cpp_package_files(self.graph)
-        return self._cpp_package_files
+    def _reachability_rescues(self) -> ReachabilityRescues:
+        """Return the cached rescue state, building it on first use."""
+        if self._rescues is None:
+            self._rescues = ReachabilityRescues(
+                bundler_alias_targets=frozenset(self._bundler_alias_targets),
+                package_files=build_package_file_map(self.graph),
+            )
+        return self._rescues
 
     def analyze(
         self,
@@ -725,6 +806,7 @@ class DeadCodeAnalyzer:
         findings = self._clamp_for_unindexed_importers(findings)
 
         min_conf = cfg.get("min_confidence", 0.4)
+        hidden_below_threshold = sum(1 for f in findings if f.confidence < min_conf)
         findings = [f for f in findings if f.confidence >= min_conf]
 
         now = datetime.now(UTC)
@@ -741,6 +823,7 @@ class DeadCodeAnalyzer:
             findings=findings,
             deletable_lines=deletable,
             confidence_summary={"high": high, "medium": medium, "low": low},
+            hidden_below_threshold=hidden_below_threshold,
         )
 
     # ------------------------------------------------------------------
@@ -770,40 +853,13 @@ class DeadCodeAnalyzer:
                 continue
             if self._should_never_flag(str(node), whitelist):
                 continue
-            # Re-export barrels (index.* / __init__.py) are reached by the
-            # names they forward or via package ``exports``/``main`` — a barrel
-            # with no inbound graph edge is not dead code.
-            if Path(str(node)).name in _BARREL_FILENAMES:
-                continue
-            if self._is_api_contract(node_data):
-                continue
-            # Bundler ``resolve.alias`` targets are reached through the
-            # aliased package name; only the config references them by path.
-            if str(node) in self._bundler_alias_targets:
-                continue
 
-            # Go reachability is package-granular: a file with no direct
-            # importer can still be live (entry-package sibling next to
-            # main.go, or a package whose siblings carry the import). Delegate
-            # to the Go helper instead of the raw file-level in_degree check.
-            node_str = str(node)
-            if node_str.endswith(".go"):
-                if is_go_file_reachable(node_str, self.graph, self._go_packages()):
-                    continue
-            elif node_str.endswith(".java") or node_str.endswith(".kt"):
-                # JVM reachability is package-aware too: sibling-rescued
-                # packages plus stereotype-annotated / ``main``-carrying
-                # files surface as live even with no direct importer.
-                if is_jvm_file_reachable(node_str, self.graph, self._jvm_packages()):
-                    continue
-            elif is_cpp_path(node_str):
-                # C/C++ reachability rescues public-API headers, ``main``-
-                # bearing TUs (apps/demos/benchmarks/fuzzers), internal
-                # headers next to their implementation files, and
-                # conditional-compile alternates that share a stem prefix.
-                if is_cpp_file_reachable(node_str, self.graph, self._cpp_packages()):
-                    continue
-            elif self.graph.in_degree(node) > 0:
+            # Barrels, API contracts, bundler-alias shims and the
+            # package-granular languages (Go / JVM / C-C++) are all rescued
+            # inside the shared predicate, which the overview assembler calls
+            # with the same state so the two passes cannot disagree about what
+            # "reachable" means. See :mod:`file_reachability`.
+            if is_file_reachable(str(node), self.graph, self._reachability_rescues()):
                 continue
 
             finding = self._make_unreachable_finding(str(node), node_data, dynamic_patterns)
@@ -922,7 +978,7 @@ class DeadCodeAnalyzer:
             confidence = min(confidence, 0.4)
 
         # Runtime-load risk factors (config / bootstrap / database /
-        # environment / script). These are files the never-flag allowlist
+        # environment / script / asset). These are files the never-flag allowlist
         # didn't catch but that are commonly referenced outside static
         # imports, so "in_degree=0" is weak evidence. Cap confidence below the
         # deletion-ready threshold and surface the factors as evidence — the
@@ -1043,9 +1099,18 @@ class DeadCodeAnalyzer:
             # any public member. Treat the whole file as live so we
             # don't flag e.g. ``BasketService`` (registered via
             # ``MapGrpcService<BasketService>()``) as an unused export.
+            # Was ("dynamic_uses", "dynamic", "framework"): the bare "dynamic"
+            # matched nothing and dynamic_imports was absent, so a file reached
+            # only by a dynamic import was never rescued here.
+            # Deliberately NOT `is_dynamic_edge`: `dynamic_imports` and
+            # `dynamic_url_route` mean the module gets loaded, which is what a
+            # plain `imports` edge means, and that is not rescued here either.
+            # Only `dynamic_uses` carries "the runtime reached a member".
+            # Widening this to every dynamic_* hides an unused export in any
+            # package.json `main` target or Django INSTALLED_APPS module.
             file_dynamically_loaded = any(
                 self.graph.get_edge_data(pred, node, {}).get("edge_type")
-                in ("dynamic_uses", "dynamic", "framework")
+                in ("dynamic_uses", "framework")
                 for pred in self.graph.predecessors(node)
             )
             if file_dynamically_loaded:
@@ -1151,11 +1216,6 @@ class DeadCodeAnalyzer:
                 # suffix check sees the attribute path itself.
                 decorators = sym.get("decorators", [])
 
-                def _decorator_base(d: str) -> str:
-                    stripped = d.lstrip("@")
-                    paren = stripped.find("(")
-                    return stripped[:paren] if paren >= 0 else stripped
-
                 if any(
                     _decorator_base(d).startswith(prefix)
                     for d in decorators
@@ -1200,8 +1260,8 @@ class DeadCodeAnalyzer:
                 if local_refs and sym_name in local_refs:
                     continue
 
-                is_deprecated = any(
-                    sym_name.endswith(suffix) for suffix in ("_DEPRECATED", "_LEGACY", "_COMPAT")
+                is_deprecated = _is_symbol_deprecated(
+                    sym_name, sym.get("decorators") or []
                 )
 
                 # ``export { local as alias }`` publishes the symbol under the
@@ -1243,16 +1303,7 @@ class DeadCodeAnalyzer:
                 # padding bases like ``BoundedLocalCache.BLCHeader``,
                 # Kotlin sealed parents, Scala typeclass traits).
                 if self.graph.has_node(sym_id) and any(
-                    self.graph[pred][sym_id].get("edge_type")
-                    in (
-                        "calls",
-                        "method_implements",
-                        "reads",
-                        "extends",
-                        "implements",
-                        "type_use",
-                        "dynamic",
-                    )
+                    self.graph[pred][sym_id].get("edge_type") in REACHABILITY_USE_EDGE_TYPES
                     for pred in self.graph.predecessors(sym_id)
                 ):
                     continue
@@ -1286,7 +1337,7 @@ class DeadCodeAnalyzer:
                     confidence = min(confidence, 0.4)
 
                 # Runtime-load risk factors for the defining file (config /
-                # bootstrap / database / environment / script): symbols in
+                # bootstrap / database / environment / script / asset): symbols in
                 # such files are often wired up reflectively, so cap below the
                 # deletion-ready threshold and tag the finding for review.
                 risk_factors = path_risk_factors(str(node))
@@ -1397,30 +1448,21 @@ class DeadCodeAnalyzer:
             decorators = node_data.get("decorators") or []
             if decorators:
 
-                def _dec_base(d: str) -> str:
-                    stripped = d.lstrip("@")
-                    paren = stripped.find("(")
-                    return stripped[:paren] if paren >= 0 else stripped
-
                 if any(
-                    _dec_base(d).startswith(prefix)
+                    _decorator_base(d).startswith(prefix)
                     for d in decorators
                     for prefix in _FRAMEWORK_DECORATORS
                 ):
                     continue
                 if any(
-                    _dec_base(d).endswith(suffix)
+                    _decorator_base(d).endswith(suffix)
                     for d in decorators
                     for suffix in _FRAMEWORK_DECORATOR_SUFFIXES
                 ):
                     continue
 
-            # "dynamic" alongside "calls": a symbol-targeted DynamicEdge
-            # (e.g. vb/handles.py's Handles/AddHandler wiring, D8) is direct
-            # evidence the symbol is invoked, even though no static call
-            # site exists for it to carry a "calls" edge.
             has_callers = any(
-                self.graph.get_edge_data(pred, node, {}).get("edge_type") in ("calls", "dynamic")
+                self.graph.get_edge_data(pred, node, {}).get("edge_type") == "calls"
                 for pred in self.graph.predecessors(node)
             )
             if has_callers:
@@ -1447,6 +1489,12 @@ class DeadCodeAnalyzer:
                 continue
 
             git_meta = self.git_meta_map.get(file_path, {})
+            # Private symbols keep the standard 0.65 base confidence even if deprecated.
+            # A private symbol has no external consumer by construction —
+            # deprecated + uncalled is the strongest possible delete signal and
+            # must not be buried below the default min_confidence floor.
+            # (0.3 is reserved for unused *exports*, where an invisible consumer
+            # outside the repo may still import it.)
             findings.append(
                 DeadCodeFindingData(
                     kind=DeadCodeKind.UNUSED_INTERNAL,
@@ -1607,9 +1655,6 @@ class DeadCodeAnalyzer:
             return True
         # __init__.py is a re-export barrel
         return Path(path).name == "__init__.py"
-
-    def _is_api_contract(self, node_data: dict) -> bool:
-        return node_data.get("is_api_contract", False)
 
     def _file_has_implementors(self, file_node: Any) -> bool:
         """Return True iff any ``implements`` / ``method_implements`` /

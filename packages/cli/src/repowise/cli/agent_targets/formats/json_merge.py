@@ -31,6 +31,8 @@ from typing import Any
 
 import click
 
+from ..types import FileAction
+
 
 def load_json_object(config_path: Path) -> dict:
     """Read a JSON object, refusing to silently replace bad content.
@@ -71,15 +73,55 @@ def load_json_object_or_value_error(config_path: Path, label: str) -> dict:
     return existing
 
 
+def is_damaged(config_path: Path) -> bool:
+    """True when *config_path* is present but is not readable JSON.
+
+    The distinction a health check lives on. A config that is absent and a
+    config that is there and unparseable both make every "is repowise wired
+    up" probe answer no, and telling the user "not installed" when the truth is
+    "your settings file has a trailing comma in it" sends them to run an
+    install that will refuse for the same reason.
+
+    False for a file that is absent or that cannot be opened at all: neither is
+    damage we can claim to have seen.
+
+    A file that is not UTF-8 counts as damage. It is present, it was opened,
+    and it is not readable JSON, which is exactly what this answers. It used to
+    escape instead: ``UnicodeDecodeError`` is a ``ValueError``, so neither
+    handler below caught it, and both callers run this inside ``doctor()``. The
+    result was not a crash -- ``repo_checks`` catches a raising ``doctor()`` --
+    but something quieter and worse: a cp1252 ``settings.json`` or
+    ``hooks.json``, an ordinary thing to meet on Windows, rendered as a
+    **passing** "Could not check" row, so the one file state this check exists
+    to report was the one state it could not report.
+    """
+    if not config_path.exists():
+        return False
+    try:
+        json.loads(config_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def json_deep_equal(left: Any, right: Any) -> bool:
     """Deep equality that ignores mapping key order.
 
     Python's ``==`` on dicts already ignores key order, so this exists for the
     case ``==`` gets wrong for our purpose: it is the check that decides whether
     a write is needed at all, and it has to walk nested structures without being
-    fooled by a list/dict type coincidence. Used to return
-    :attr:`~..types.FileAction.UNCHANGED` instead of rewriting a file whose
-    bytes would not move.
+    fooled by a numeric-tower or bool/int coincidence.
+
+    Its caller is the **TOML** path, not the JSON one, which is worth saying
+    plainly. JSON configs are rendered from a dict every time, so comparing the
+    rendered text answers "would this write move the file" exactly. The TOML
+    merge rewrites the source text and re-appends the table it owns, so the text
+    legitimately differs on a re-run while the *document* is identical —
+    comparing documents is the only way to see that the write is a no-op. It
+    lives here rather than in ``toml_merge`` because the structure it walks is
+    the JSON data model, which is what ``tomllib`` hands back.
     """
     # Strict on type, including across the numeric tower. The contract is "the
     # bytes would not move", and ``json.dumps`` renders 1 and 1.0 differently,
@@ -101,20 +143,6 @@ def json_deep_equal(left: Any, right: Any) -> bool:
 def dumps_config(data: dict) -> str:
     """Serialize exactly as every existing writer does: indent 2, trailing newline."""
     return json.dumps(data, indent=2) + "\n"
-
-
-def backup_unparseable(config_path: Path) -> Path | None:
-    """Copy an unparseable file to ``<path>.backup`` before it is overwritten.
-
-    Only for paths where the caller intends to overwrite regardless. Where the
-    caller can decline instead, declining is better and this is not used.
-    """
-    backup = config_path.with_suffix(config_path.suffix + ".backup")
-    try:
-        backup.write_bytes(config_path.read_bytes())
-        return backup
-    except OSError:
-        return None
 
 
 def atomic_write_text(path: Path, content: str, *, newline: str | None = None) -> None:
@@ -158,9 +186,39 @@ def atomic_write_text(path: Path, content: str, *, newline: str | None = None) -
             os.chmod(target, mode)
 
 
-def write_json_config(path: Path, data: dict) -> None:
-    """Atomically write *data* in the repo's standard JSON config shape."""
-    atomic_write_text(path, dumps_config(data))
+def write_json_config(path: Path, data: dict) -> FileAction:
+    """Atomically write *data*, skipping the write when it would change nothing.
+
+    Returns without writing when the file already holds exactly the bytes this
+    call would produce, so a re-run reports
+    :attr:`~..types.FileAction.UNCHANGED` instead of an update it did not make.
+
+    The comparison is against the *translated* rendering, not the raw one.
+    :func:`atomic_write_text` passes ``newline=None`` here, so on Windows this
+    writer emits ``\\r\\n`` where :func:`dumps_config` produced ``\\n``.
+    Comparing the untranslated text would call every Windows re-run an update;
+    normalising the file's line endings instead would go wrong the other way —
+    a CRLF file on POSIX would compare equal and be left alone, where the
+    unconditional write used to normalise it. Same trap as the marker block's,
+    and the same answer: compare the bytes that would actually land.
+
+    Byte-exact, so this is a narrower promise than "the data is already right":
+    a file someone reindented, or whose top-level keys sit in another order,
+    holds the same data and is still rewritten. That matches what the
+    unconditional write did before and is the conservative direction — the
+    action stays truthful either way, and the alternative is deciding that a
+    file we would rewrite is "unchanged".
+    """
+    rendered = dumps_config(data)
+    action = FileAction.CREATED
+    if path.exists():
+        action = FileAction.UPDATED
+        on_disk = rendered.replace("\n", os.linesep) if os.linesep != "\n" else rendered
+        with contextlib.suppress(OSError):
+            if path.read_bytes() == on_disk.encode("utf-8"):
+                return FileAction.UNCHANGED
+    atomic_write_text(path, rendered)
+    return action
 
 
 def merge_server_entries(servers: dict, new_entry: dict) -> dict:

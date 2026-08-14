@@ -30,8 +30,11 @@ from repowise.server.mcp_server.tool_answer.answer import _with_candidates
 
 # Returns that route through this are covered: the helper attaches the block
 # itself. ``_degraded_payload`` is the shared shape for both synthesis-less
-# paths and calls ``_with_candidates`` internally.
-_COVERING_CALLS = {"_with_candidates", "_degraded_payload"}
+# paths and calls ``_with_candidates`` internally. ``_degrade`` is the local
+# binding of ``_degraded_payload`` inside ``get_answer``, which exists so the
+# two synthesis-less returns name only what differs between them; it forwards
+# ``resolved_pool`` like any other call to it.
+_COVERING_CALLS = {"_with_candidates", "_degraded_payload", "_degrade"}
 
 # The mainline return. It attaches ``candidates`` a few lines above itself
 # rather than through the helper, because it also has to build the block after
@@ -71,6 +74,10 @@ def test_no_post_retrieval_return_bypasses_the_candidates_helper():
         if node.lineno <= pool_line:
             continue  # fires before retrieval; there is no pool to hand over
         value = node.value
+        # ``_degraded_payload`` builds evidence off disk, so it is awaited; the
+        # covering call is the awaited expression, not the ``await`` node.
+        if isinstance(value, ast.Await):
+            value = value.value
         if isinstance(value, ast.Name) and value.id == _MAINLINE_RETURN:
             continue
         covered = (

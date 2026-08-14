@@ -9,18 +9,25 @@ this one holds the free functions it calls. No state, no imports from
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 from tree_sitter import Node
 
 from .extractors import node_text
 
+if TYPE_CHECKING:
+    from .models import Symbol
+
 log = structlog.get_logger(__name__)
 
 # Private alias for internal use (mirrors the one in parser.py)
 _node_text = node_text
+
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _run_query(query: object, root_node: Node) -> list[dict[str, list[Node]]]:
@@ -111,11 +118,202 @@ def _qualified_cpp_parent(name_node: Node, src: str) -> str | None:
     return text.rsplit("::", 1)[-1] or None
 
 
+def _qualified_pascal_parent(name_node: Node, src: str) -> str | None:
+    """Return the owning class for a Pascal out-of-line method header.
+
+    ``function TCalculator.Add(...): Integer;`` in an implementation
+    section is captured by pascal.scm's ``genericDot`` patterns, where the
+    bare ``@symbol.name`` is the ``rhs`` (``Add``) and the qualifying type
+    lives in the sibling ``lhs`` field (``TCalculator``). Nesting-based
+    ``_find_parent`` can't see this: the ``defProc`` node sits in the
+    unit's implementation section, physically outside the class's
+    ``declType`` body declared in the interface section. Handles both the
+    plain (``genericDot rhs: identifier``) and generic-method
+    (``genericDot rhs: genericTpl entity: identifier``) query shapes.
+
+    Uses ``node_text`` (tree-sitter's own byte-accurate decode), not raw
+    ``src`` byte-offset slicing — Pascal identifiers and unit names are
+    frequently non-ASCII (Cyrillic) in this codebase's real-world sources,
+    and slicing a decoded ``str`` by *byte* offsets misaligns on any
+    multi-byte character.
+
+    Returns ``None`` when the name node isn't inside a qualified header
+    (i.e. a free function/procedure).
+    """
+    parent = name_node.parent
+    if parent is not None and parent.type == "genericTpl":
+        parent = parent.parent
+    if parent is None or parent.type != "genericDot":
+        return None
+    lhs = parent.child_by_field_name("lhs")
+    if lhs is None:
+        return None
+    text = node_text(lhs, src).strip()
+    return text or None
+
+
 def _build_qualified_name(file_path: str, parent_name: str | None, name: str) -> str:
     module = Path(file_path).with_suffix("").as_posix().replace("/", ".")
     if parent_name:
         return f"{module}.{parent_name}.{name}"
     return f"{module}.{name}"
+
+
+_PASCAL_USES_IN_CLAUSE_RE = re.compile(rb"\bin\b[ \t]*'(?:[^'\r\n]|'')*'")
+
+
+def _sanitize_pascal_project_source(source: bytes) -> bytes:
+    """Blank Delphi/FPC project-file ``unit in 'path.pas'`` clauses.
+
+    ``.dpr``/``.dpk``/``.lpr`` project files map each unit to its source
+    path right in the ``uses`` clause -- ``uses SysUtils, MyUnit in
+    'src\\MyUnit.pas';`` -- and Delphi's IDE writes this automatically for
+    every unit added to a project, making it the norm rather than the
+    exception in real ``.dpr``/``.dpk`` files (confirmed against this
+    repo's own ``MTN2.dpr``: every non-RTL unit uses it).
+
+    tree-sitter-pascal's grammar has no rule for the trailing ``in
+    '...'`` at all. Hitting it mid-``declUses`` doesn't just fail that
+    one unit -- the parser's error recovery folds the ``in``, the path
+    string, and every subsequent comma-separated unit into one corrupted
+    ``moduleName`` node spanning to wherever it happens to resync, so a
+    single ``in`` clause was silently swallowing the rest of the ``uses``
+    list (observed on ``MTN2.dpr``: 4 imports extracted instead of ~80,
+    the 4th holding several KB of raw multi-line garbage as its
+    ``module_path``). This is an upstream grammar gap, not something a
+    ``.scm`` query can route around -- the AST itself is malformed before
+    any query runs.
+
+    Blanks the matched span with spaces (never a raw newline -- a Pascal
+    string literal can't contain one, so no line is fully consumed) to
+    preserve every other byte offset in the file, so line numbers for
+    symbols/imports/calls elsewhere are unaffected. `'ABC'` doesn't need
+    the doubled-quote (`''`) escape handled specially for *finding* the
+    end of the string here (the regex already treats `''` as staying
+    inside the literal), only for correctness of the match's own extent.
+
+    Scoped to project files specifically: this syntax is invalid outside
+    a ``uses`` clause and ``.pas``/``.pp`` unit files can't legally carry
+    it, so there's nothing to blank there and no reason to run the regex
+    over every unit file in a codebase.
+    """
+    if not _PASCAL_USES_IN_CLAUSE_RE.search(source):
+        return source
+    out = bytearray(source)
+    for m in _PASCAL_USES_IN_CLAUSE_RE.finditer(source):
+        start, end = m.span()
+        out[start:end] = b" " * (end - start)
+    return bytes(out)
+
+
+_PASCAL_PROJECT_EXTENSIONS = (".dpr", ".dpk", ".lpr")
+
+
+def prepare_pascal_source(source: bytes, path: str | None) -> bytes:
+    """Single entry point for every Pascal byte-preserving sanitizer.
+
+    Called from :func:`~.sfc_source.prepare_source` -- the same
+    registry-dispatched hook every other tree-sitter consumer (the
+    ingestion parser, plus the complexity/dataflow/duplication health
+    walkers) already calls before handing bytes to a ``Parser`` -- rather
+    than parser.py special-casing Pascal in its own if-blocks. That keeps
+    ``docs/architecture/language-support.md``'s "zero changes to
+    parser.py" promise for a new language, and means the health walkers
+    get the same clean projection the ingestion parser does instead of
+    parsing raw bytes.
+
+    Only wraps ``_sanitize_pascal_project_source`` (``.dpr``/``.dpk``/
+    ``.lpr`` ``in '...'`` clauses), gated on *path*'s extension since that
+    syntax is invalid in a plain unit file. An earlier revision of this
+    function also blanked whatever an anonymous ``array[...] of record``
+    element type's parse errors touched, discovered via ERROR-node spans
+    from a throwaway parse. Dropped after review (PR #1353): tree-sitter's
+    error recovery for that construct doesn't cleanly wrap the bad
+    construct in one ERROR node -- on the reviewer's repro, one of the
+    spans it found was the class's own legitimate closing ``end;``, and
+    blanking it produced the exact same broken structure (the following
+    method detached from its class) as running no sanitizer at all. A
+    correct fix needs a nesting-aware nested-record/variant-part scanner,
+    which is more surface area than one occurrence in one file (see the
+    dropped function's own docstring) justifies; the anon-record case is
+    left to degrade to a wrong parent for that one class, same as any
+    other unhandled grammar gap.
+    """
+    if path and path.lower().endswith(_PASCAL_PROJECT_EXTENSIONS):
+        return _sanitize_pascal_project_source(source)
+    return source
+
+
+def _dedupe_pascal_interface_symbols(
+    symbols: list[Symbol], node_types: list[str]
+) -> list[Symbol]:
+    """Drop an interface-section method signature once its implementation
+    is also present, so the two don't become two graph nodes for one method.
+
+    Pascal declares a method's signature once in the ``interface`` section
+    (``declProc``, no body) and its full body once in the
+    ``implementation`` section (``defProc``) — two distinct physical AST
+    nodes pascal.scm both legitimately captures (see the query file's
+    comment). Once ``_find_parent`` (nesting) and ``_qualified_pascal_parent``
+    (the ``TFoo.Method`` header) resolve both to the same
+    ``(parent_name, name)``, keep only the ``defProc`` version: it carries
+    the real body, which is what ``get_symbol`` should return, and the
+    ``declProc`` duplicate would otherwise leave two ``Add`` nodes in the
+    graph for one logical method.
+
+    Keyed on ``(parent_name, signature)`` — normalized, see
+    ``_pascal_dedupe_key`` — rather than just ``(parent_name, name)`` so
+    that Pascal ``overload;`` siblings (same name, different parameter
+    lists) are told apart: an interface-only overload must survive even
+    when a *different* overload of the same name has a same-file
+    implementation (verified against a reproduction where a 2-overload
+    class with only one variant implemented was silently losing the
+    other variant's interface declaration).
+
+    Normalization matters in practice, not just in theory: scanned
+    against a real ~150-file Delphi codebase, 168 method pairs shared a
+    class+name but escaped a raw-signature-text match — almost all of
+    them a long parameter list wrapped across lines differently between
+    the compact interface declaration and the implementation (extremely
+    common Delphi formatting), a handful differing only by identifier
+    case (Pascal is case-insensitive, so ``TFoo.Add`` and
+    ``TFOO.ADD`` name the same method). ``_pascal_dedupe_key`` strips all
+    whitespace and lowercases before comparing so both collapse
+    correctly.
+
+    Still imperfect: Pascal's compiler doesn't require parameter *names*
+    to match between an interface declaration and its implementation
+    (only the types, for overload resolution), so a same-file rename
+    between the two still produces different normalized keys and defeats
+    this dedup, leaving both symbols. Unlike the whitespace/case cases
+    above, no evidence of this actually happening was found in the real
+    codebase this was checked against — left as a documented gap rather
+    than parsing parameter types out of ``declArgs`` for an exact match.
+    """
+    impl_keys = {
+        _pascal_dedupe_key(s.parent_name, s.signature)
+        for s, nt in zip(symbols, node_types, strict=True)
+        if nt == "defProc"
+    }
+    return [
+        s
+        for s, nt in zip(symbols, node_types, strict=True)
+        if not (nt == "declProc" and _pascal_dedupe_key(s.parent_name, s.signature) in impl_keys)
+    ]
+
+
+def _pascal_dedupe_key(parent_name: str | None, signature: str) -> tuple[str | None, str]:
+    """Normalize a (parent, signature) pair for Pascal's interface/impl dedup.
+
+    Whitespace-insensitive (multi-line parameter lists get reformatted
+    between the interface declaration and the implementation constantly
+    in real Delphi code) and case-insensitive (identifiers are
+    case-insensitive in Pascal, so this needs to hold for the *class*
+    name half of the key too, not just the signature).
+    """
+    parent_key = parent_name.lower() if parent_name else None
+    sig_key = _WHITESPACE_RE.sub("", signature).lower()
+    return (parent_key, sig_key)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +365,8 @@ _BUILTIN_CSHARP_TYPES: frozenset[str] = frozenset(
 )
 
 _PARAM_ORIGIN_BY_ANCESTOR: dict[str, str] = {
+    "type_argument_list": "generic_argument",
+    "typeof_expression": "typeof",
     "constructor_declaration": "ctor_param",
     "method_declaration": "method_param",
     "delegate_declaration": "delegate_param",
@@ -228,10 +428,9 @@ def _head_type_identifier(type_node: Node, src: str) -> str | None:
 
     The point of returning the head identifier is that the
     DotNetProjectIndex type-name lookup is keyed by unqualified type
-    name. Generic-arg recursion is intentionally NOT done here — each
-    generic arg is captured in its own ``@param.type`` if it's a real
-    parameter type, and the resolver doesn't currently track generic
-    instantiation graphs.
+    name. Generic-arg recursion is intentionally NOT done here — each generic
+    argument is captured from its own ``type_argument_list`` node, including
+    nested arguments and invocation-only type uses.
     """
     head_node: Node | None = type_node
 
